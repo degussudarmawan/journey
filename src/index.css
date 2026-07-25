@@ -1,0 +1,9 @@
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  background: oklch(98.5% 0.003 260);
+}
+
+* {
+  box-sizing: border-box;
+}

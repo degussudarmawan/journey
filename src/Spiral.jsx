@@ -1,5 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { SpiralEngine, DEFAULT_PALETTE } from "./spiralEngine";
+import { SketchLayer } from "./sketchLayer";
 
 /**
  * Scroll-driven dot animation: a resting grid explodes into a spiral, spells
@@ -25,9 +26,19 @@ export default function Spiral({
   cursorRepel = 1,
 }) {
   const canvasRef = useRef(null);
+  const sketchCanvasRef = useRef(null);
   const trackRef = useRef(null);
   const hintRef = useRef(null);
   const engineRef = useRef(null);
+  const sketchRef = useRef(null);
+
+  // Whether the doodle layer is currently accepting strokes (only once the
+  // starburst has fully settled). This is real UI state — it changes maybe
+  // twice a scroll, not 60 times a second like particle positions — so
+  // unlike the animation itself, useState is the right tool here: it drives
+  // the Clear button's visibility declaratively instead of fighting React
+  // for control of the DOM via an imperative style mutation.
+  const [canDraw, setCanDraw] = useState(false);
 
   // How many words are actually active (mirrors the filtering rebuildWords()
   // does in spiralEngine.js) — used to size the scroll track so each word
@@ -65,9 +76,32 @@ export default function Spiral({
     );
     engineRef.current = engine;
     engine.mount();
+
+    // The doodle layer only accepts new strokes once the starburst has
+    // fully settled (the last stage) — mid-transition drawing would be
+    // fighting with dots that are still moving into place.
+    const isStarHold = () => {
+      const eng = engineRef.current;
+      if (!eng || !eng.stageDefs) return false;
+      return eng.getStage(eng.scrollT).kind === "starHold";
+    };
+    const sketch = new SketchLayer(sketchCanvasRef.current, isStarHold);
+    sketchRef.current = sketch;
+    sketch.mount();
+
+    // Keeps the Clear button's visibility (canDraw) in sync with scroll —
+    // same underlying check as isStarHold above, just also pushed into
+    // React state so the button can be styled declaratively.
+    const onScroll = () => setCanDraw(isStarHold());
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+
     return () => {
       engine.unmount();
       engineRef.current = null;
+      sketch.unmount();
+      sketchRef.current = null;
+      window.removeEventListener("scroll", onScroll);
     };
   }, []);
 
@@ -100,10 +134,58 @@ export default function Spiral({
             overflow: "hidden",
           }}
         >
+          {/* Doodle layer: sits underneath the particle canvas, so marks
+              show through the gaps between dots, like the star is drawn on
+              top of a page the user has been scribbling on. Only accepts
+              new strokes once SketchLayer's isActive() says so (see the
+              mount effect above) — active or not, it's harmless to have it
+              here since it only ever reacts to pointer events. */}
+          <canvas
+            ref={sketchCanvasRef}
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "block",
+              width: "100%",
+              height: "100%",
+            }}
+          />
           <canvas
             ref={canvasRef}
-            style={{ display: "block", width: "100%", height: "100%" }}
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "block",
+              width: "100%",
+              height: "100%",
+            }}
           />
+          <button
+            type="button"
+            onClick={() => sketchRef.current?.clear()}
+            style={{
+              position: "absolute",
+              bottom: 28,
+              right: 28,
+              opacity: canDraw ? 1 : 0,
+              pointerEvents: canDraw ? "auto" : "none",
+              transition: "opacity .2s linear",
+              fontFamily: "'Playfair Display', serif",
+              fontStyle: "italic",
+              fontWeight: 600,
+              fontSize: 12,
+              letterSpacing: "0.28em",
+              textTransform: "uppercase",
+              color: "oklch(40% 0.02 260)",
+              background: "oklch(98.5% 0.003 260 / 0.7)",
+              border: "1px solid oklch(40% 0.02 260 / 0.35)",
+              borderRadius: 999,
+              padding: "8px 18px",
+              cursor: "pointer",
+            }}
+          >
+            Clear
+          </button>
           <div
             ref={hintRef}
             style={{

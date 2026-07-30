@@ -30,11 +30,17 @@
                     (starTips/buildStarOutline) that's rasterised into a
                     "radius per angle" lookup table (buildStarLUT) and then
                     filled with a halftone dot grid (buildStar).
+     5. Orbit     — the star's own spikes (ORBIT_SPIKES) detach one at a
+                    time, each a whole rigid needle with real 3D volume and
+                    orientation, and circle the centre on a tilted ring:
+                    perspective + far-to-near draw order give it real depth
+                    rather than a flat spinning disc. See buildOrbitRays(),
+                    orbitFrame() and orbitDotPos().
 
    THE TIMELINE (scroll fraction t, 0 = top of page, 1 = bottom of track)
    is *generated*, not hardcoded — buildStageDefs(wordCount) lays out:
      static -> explode -> [toWord -> hold -> toSpiral] per word (the last
-     word gets toStar instead of toSpiral) -> starHold
+     word gets toStar instead of toSpiral) -> starHold -> toOrbit -> orbitHold
    with proportional weights that are re-normalised to always cover exactly
    0..1, whatever wordCount is. rebuildWords() calls it every time the set
    of active words changes, so adding/removing a word (e.g. leaving word4
@@ -52,6 +58,9 @@
      - Star silhouette shape:   starTips() angles/lengths, STAR_VALLEY, STAR_BOW
      - Particle density:        spacing math in buildGrid() and buildStar()
      - Stage timing:            the weight constants in buildStageDefs()
+     - Orbit act (3D ring):     the ORBIT_* fields — which spikes detach and
+                                in what order, tilt, speed, radius,
+                                perspective strength, detach stagger
    ============================================================================ */
 
 export const DEFAULT_PALETTE = ["#c98a8a", "#8aa8c9", "#8ec9a6", "#b98ac9"];
@@ -328,11 +337,15 @@ export class SpiralEngine {
     const TO_WORD = 0.09,
       HOLD = 0.06,
       TO_SPIRAL = 0.05;
+    const TO_ORBIT = 0.1,
+      ORBIT_HOLD = 0.16; // generous: this is the interactive final act
     const rawTotal =
       STATIC +
       EXPLODE +
       TO_STAR +
       STAR_HOLD +
+      TO_ORBIT +
+      ORBIT_HOLD +
       (TO_WORD + HOLD + TO_SPIRAL) * (wordCount - 1) + // every word but the last also does toSpiral
       (TO_WORD + HOLD); // the last word skips toSpiral (goes to the star instead)
     const scale = 1 / rawTotal;
@@ -353,6 +366,8 @@ export class SpiralEngine {
     }
     push("toStar", TO_STAR, { prevWord: wordCount - 1 });
     push("starHold", STAR_HOLD);
+    push("toOrbit", TO_ORBIT);
+    push("orbitHold", ORBIT_HOLD);
     return defs;
   }
 
@@ -595,6 +610,303 @@ export class SpiralEngine {
         };
       });
     }
+
+    this.buildOrbitRays();
+  }
+
+  // ---- Orbiting ray pieces (the final act) ------------------------------------
+  // Every spike of the star detaches, one at a time, and circles the centre
+  // on a tilted orbit. Three things make this work:
+  //
+  //   1. Each piece is a WHOLE spike. Dots are partitioned by nearestRay(),
+  //      with no inner cutoff, so a piece runs from the star's centre all the
+  //      way out to its tip — the complete wedge-to-needle shape, with
+  //      nothing left behind as a stub.
+  //
+  //   2. A detaching spike moves as a RIGID BODY in 3D. Each dot is stored in
+  //      the spike's own frame — rayAlong (out along the axis), rayAcross
+  //      (perpendicular, in the star's plane), rayUp (perpendicular, out of
+  //      it) — and the transition interpolates that *frame*: pivot and the
+  //      three axis vectors. Interpolating each dot's position independently
+  //      instead would collapse the needle through its own centre whenever
+  //      the rotation is large, which is what made it look shredded.
+  //
+  //   3. The needles are REAL 3D, not billboards. Each stands upright along
+  //      the ring's normal (see orbitFrame) with its width along the track and
+  //      its thickness radial, so it foreshortens and leans as it swings
+  //      around, and rayUp gives it a round cross-section instead of zero
+  //      thickness. That thickness is scaled by detach progress, so a piece
+  //      "inflates" from the star's flat halftone into a solid needle as it
+  //      leaves.
+  //
+  // Indices into starTips(): 0:-137° 1:-90° 2:-47° 3:0° 4:43° 5:90° 6:136° 7:180°
+  // Listed in detach order: starts with the long bottom ray, then sweeps
+  // around the circle. Drop entries here to keep those spikes on the star.
+  ORBIT_SPIKES = [5, 6, 7, 0, 1, 2, 3, 4];
+  ORBIT_TILT_DEG = 72; // 0 = flat circle facing the viewer, 90 = fully edge-on
+  ORBIT_SPEED = 0.32; // orbital angular speed, rad/s
+  ORBIT_RADIUS_FRAC = 0.3; // orbit radius, as a fraction of min(w,h)
+  ORBIT_FOCAL = 900; // perspective focal length in px — smaller = stronger depth
+  ORBIT_UNDULATE = 0.15; // vertical rise/fall of the track, as a fraction of radius
+  ORBIT_ANCHOR = 0.15; // point along a spike that rides the track (0 = base, 1 = tip) — low so upright pieces stand on the ring
+  ORBIT_DETACH_WINDOW = 0.42; // fraction of the toOrbit stage one piece's flight takes
+  ORBIT_DEPTH_FADE = 2.2; // how much far pieces fade; 0 = no depth fade
+  ORBIT_MIN_ALPHA = 0.3; // floor on that fade, so far pieces never vanish
+  ORBIT_THICKNESS = 1; // multiplier on each needle's out-of-plane thickness
+
+  // Partitions every halftone dot into its spike and records it in that
+  // spike's local 3D frame. Dots belonging to spikes not listed in
+  // ORBIT_SPIKES stay in star formation forever (orbitResidue).
+  buildOrbitRays() {
+    const n = this.ORBIT_SPIKES.length;
+
+    // Per-spike constants: axis angle, how far out the needle runs, and the
+    // point along it that rides the orbit track.
+    this.orbitSlots = this.ORBIT_SPIKES.map((spikeIdx) => {
+      const a = this.starTipsList[spikeIdx].a;
+      const tipLen = this.starTipsList[spikeIdx].len;
+      return {
+        spikeIdx,
+        spikeAngle: a,
+        needleLen: Math.max(1, tipLen),
+        anchorAlong: tipLen * this.ORBIT_ANCHOR,
+      };
+    });
+
+    const slotOf = new Map(this.ORBIT_SPIKES.map((s, i) => [s, i]));
+    const groups = Array.from({ length: n }, () => []);
+    const residue = [];
+
+    for (const p of this.particles) {
+      if (!p.starSub) continue;
+      for (const sub of p.starSub) {
+        const slotIdx = slotOf.get(sub.ray);
+        if (slotIdx === undefined) {
+          sub.orbitSlot = -1; // a spike that stays put
+          residue.push({ p, sub });
+          continue;
+        }
+        const slot = this.orbitSlots[slotIdx];
+        // The dot's resting position relative to the star centre, rewritten
+        // in its spike's frame — moving/rotating that frame later carries the
+        // needle's exact shape along with it.
+        const x = sub.r0 * Math.cos(sub.theta);
+        const y = sub.r0 * Math.sin(sub.theta);
+        const ca = Math.cos(slot.spikeAngle),
+          sa = Math.sin(slot.spikeAngle);
+        sub.rayAlong = x * ca + y * sa;
+        sub.rayAcross = -x * sa + y * ca;
+        sub.orbitSlot = slotIdx;
+        groups[slotIdx].push({ p, sub });
+      }
+    }
+
+    // Give each needle a round cross-section. The star is a flat halftone, so
+    // there's no real depth to read off it: instead, measure how wide the
+    // spike is at each point along its axis (bucketed max |across|), then
+    // treat that as the radius of a circular cross-section and place the dot
+    // somewhere on the remaining out-of-plane chord. Result is a spindle with
+    // volume rather than a flat sheet.
+    const NB = 48;
+    groups.forEach((g, gi) => {
+      const slot = this.orbitSlots[gi];
+      const half = new Float64Array(NB);
+      const bucketOf = (along) =>
+        this.clamp(Math.floor((along / slot.needleLen) * NB), 0, NB - 1);
+      for (const { sub } of g) {
+        const b = bucketOf(sub.rayAlong);
+        const across = Math.abs(sub.rayAcross);
+        if (across > half[b]) half[b] = across;
+      }
+      let i = 0;
+      for (const { sub } of g) {
+        const hw = half[bucketOf(sub.rayAlong)];
+        const room = Math.sqrt(
+          Math.max(0, hw * hw - sub.rayAcross * sub.rayAcross),
+        );
+        sub.rayUp =
+          (this.hash(i * 13.77 + gi * 3.1) - 0.5) *
+          2 *
+          room *
+          this.ORBIT_THICKNESS;
+        i++;
+      }
+    });
+
+    this.orbitGroups = groups;
+    this.orbitResidue = residue;
+  }
+
+  // Per-frame, per-piece state: computed once per piece here rather than per
+  // halftone dot (there are thousands of those). Builds each piece's full 3D
+  // frame — pivot plus three axis vectors — interpolated from "attached and
+  // flat on the star" to "in orbit and fully 3D". Also fixes the draw order:
+  // far pieces first, so nearer ones paint over them.
+  orbitFrame(elapsed, stageMix) {
+    const { w, h } = this.dims;
+    const n = this.orbitSlots.length;
+    const T = (this.ORBIT_TILT_DEG * Math.PI) / 180;
+    const cosT = Math.cos(T),
+      sinT = Math.sin(T);
+    const R = Math.min(w, h) * this.ORBIT_RADIUS_FRAC;
+    this.orbitRadius = R;
+    this.orbitCx = w / 2;
+    this.orbitCy = h / 2;
+
+    // The orbital plane is spanned by e1 = (1,0,0) and e2 = (0,cosT,sinT), so
+    // its normal — the axis a needle's thickness sticks out along — is:
+    const nx = 0,
+      ny = -sinT,
+      nz = cosT;
+
+    // Stagger so pieces leave one after another, the last finishing just as
+    // the stage ends. They overlap slightly, which reads more naturally than
+    // a strictly one-at-a-time queue.
+    const win = this.ORBIT_DETACH_WINDOW;
+    const step = n > 1 ? (1 - win) / (n - 1) : 0;
+
+    const frames = this._orbitFrames || (this._orbitFrames = []);
+    for (let k = 0; k < n; k++) {
+      const slot = this.orbitSlots[k];
+      const pose = frames[k] || (frames[k] = {});
+      const phi = elapsed * this.ORBIT_SPEED + (k * Math.PI * 2) / n;
+      const cp = Math.cos(phi),
+        sp = Math.sin(phi);
+
+      // Where on the ring this piece sits. The gentle second-harmonic lift
+      // makes the track rise and fall like a ribbon instead of sitting
+      // perfectly in one plane.
+      const lift = Math.sin(phi * 2 + k * 0.7) * R * this.ORBIT_UNDULATE;
+      const tx = cp * R;
+      const ty = sp * R * cosT + lift;
+      const tz = sp * R * sinT;
+
+      // 3D direction of travel (d/dphi of the ring), and the in-plane radial
+      // direction that completes an orthonormal frame with the plane normal
+      // (d x N works out to exactly "outward from the centre, in-plane").
+      let dx = -sp,
+        dy = cp * cosT,
+        dz = cp * sinT;
+      const dl = Math.hypot(dx, dy, dz) || 1;
+      dx /= dl;
+      dy /= dl;
+      dz /= dl;
+      let bx = dy * nz - dz * ny,
+        by = dz * nx - dx * nz,
+        bz = dx * ny - dy * nx;
+      const bl = Math.hypot(bx, by, bz) || 1;
+      bx /= bl;
+      by /= bl;
+      bz /= bl;
+
+      const m = this.clamp((stageMix - k * step) / win, 0, 1);
+      const e = m * m * (3 - 2 * m); // smoothstep ease
+
+      // The piece's frame while still attached: pivot at its anchor point on
+      // the star, axes flat in the screen plane. Star and orbit centres
+      // differ, so express the pivot relative to the orbit centre.
+      const a = slot.spikeAngle;
+      const fx = Math.cos(a),
+        fy = Math.sin(a);
+      const sx = this.starCx - this.orbitCx + slot.anchorAlong * fx;
+      const sy = this.starCy - this.orbitCy + slot.anchorAlong * fy;
+
+      pose.e = e;
+      pose.px = this.lerp(sx, tx, e);
+      pose.py = this.lerp(sy, ty, e);
+      pose.pz = tz * e;
+
+      // Axis vectors, normalised-lerped between the two frames. Close enough
+      // to a proper slerp over this short a flight, and far cheaper.
+      //
+      // The needle's long axis ends up along the ring's NORMAL, so the pieces
+      // stand upright out of the orbital plane rather than lying along their
+      // direction of travel. (Swap the `n*` and `d*` vectors between the two
+      // blocks below to lay them along the track instead.) With the ring
+      // tilted, the normal is very close to screen-vertical, so they read as
+      // standing pins that lean slightly with perspective.
+      let axx = this.lerp(fx, nx, e),
+        axy = this.lerp(fy, ny, e),
+        axz = nz * e;
+      const al = Math.hypot(axx, axy, axz) || 1;
+      pose.ax = axx / al;
+      pose.ay = axy / al;
+      pose.az = axz / al;
+
+      let cxx = this.lerp(-fy, dx, e),
+        cyy = this.lerp(fx, dy, e),
+        czz = dz * e;
+      const cl = Math.hypot(cxx, cyy, czz) || 1;
+      pose.cx = cxx / cl;
+      pose.cy = cyy / cl;
+      pose.cz = czz / cl;
+
+      // Thickness sticks out along the remaining axis (radially, in-plane).
+      pose.ux = bx;
+      pose.uy = by;
+      pose.uz = bz;
+      pose.slot = slot;
+      pose.z = tz * e; // for coarse piece-level depth ordering
+
+      // Depth fade, keyed off the track point so it stays constant across the
+      // piece (per-dot alpha would mean thousands of canvas state changes).
+      const trackPersp = this.ORBIT_FOCAL / (this.ORBIT_FOCAL + pose.z);
+      pose.alpha = this.clamp(
+        1 - (1 - trackPersp) * this.ORBIT_DEPTH_FADE,
+        this.ORBIT_MIN_ALPHA,
+        1,
+      );
+    }
+
+    this._orbitOrder = frames
+      .map((_, i) => i)
+      .sort((a, b) => frames[b].z - frames[a].z);
+  }
+
+  // Screen placement of one halftone dot inside its piece: position it in the
+  // piece's 3D frame, then project. Out-of-plane thickness is scaled by
+  // detach progress so an attached piece is exactly as flat as the star it's
+  // still part of.
+  orbitDotPos(sub, f) {
+    const la = sub.rayAlong - f.slot.anchorAlong;
+    const lc = sub.rayAcross;
+    const lu = sub.rayUp * f.e;
+    const x = f.px + la * f.ax + lc * f.cx + lu * f.ux;
+    const y = f.py + la * f.ay + lc * f.cy + lu * f.uy;
+    const z = f.pz + la * f.az + lc * f.cz + lu * f.uz;
+    const persp = this.ORBIT_FOCAL / (this.ORBIT_FOCAL + z);
+    return {
+      x: this.orbitCx + x * persp,
+      y: this.orbitCy + y * persp,
+      scale: persp,
+    };
+  }
+
+  // Cursor repel, shared by the star and orbit stages: pushes a dot away
+  // from the pointer within `radius`, smoothed through sub.rox/roy so the
+  // push eases in and out instead of snapping.
+  repelFromPointer(sub, x, y, strength, radius, presence) {
+    let tox = 0,
+      toy = 0;
+    if (this.pointer.active && strength > 0) {
+      const dx = x - this.pointer.x,
+        dy = y - this.pointer.y;
+      const d = Math.hypot(dx, dy);
+      if (d < radius) {
+        const f = Math.pow(1 - d / radius, 1.7);
+        const push = f * radius * 0.62 * strength * presence;
+        if (d > 0.001) {
+          tox = (dx / d) * push;
+          toy = (dy / d) * push;
+        } else {
+          tox = Math.cos(sub.ph) * push; // dot is exactly under the cursor
+          toy = Math.sin(sub.ph) * push;
+        }
+      }
+    }
+    sub.rox += (tox - sub.rox) * 0.16;
+    sub.roy += (toy - sub.roy) * 0.16;
+    return { x: x + sub.rox, y: y + sub.roy };
   }
 
   // Sway is per-ray and constant across a frame, so it is computed once here
@@ -728,9 +1040,12 @@ export class SpiralEngine {
 
   // ---- Main render loop ---------------------------------------------------
   // Runs every animation frame. For each particle, works out which stage is
-  // active and where that particle should be this frame, then draws it. The
-  // star stages (toStar/starHold) are handled in their own branch since a
-  // particle explodes into multiple halftone sub-dots (p.starSub) there.
+  // active and where that particle should be this frame, then draws it. Two
+  // stage groups get their own branch, because in both a single particle is
+  // drawn as several halftone sub-dots (p.starSub) rather than one dot:
+  //   - the star stages (toStar/starHold), and
+  //   - the orbit stages (toOrbit/orbitHold), which additionally iterate
+  //     ray-by-ray in depth order rather than particle-by-particle.
   loop(ts) {
     if (!this.startTime) this.startTime = ts;
     const elapsed = (ts - this.startTime) / 1000;
@@ -747,11 +1062,13 @@ export class SpiralEngine {
       props.accentPalette && props.accentPalette.length
         ? props.accentPalette
         : DEFAULT_PALETTE;
-    // 0 = full accent colours (word stages), 1 = fully settled to ink (star stages).
+    const inOrbit = stage.kind === "toOrbit" || stage.kind === "orbitHold";
+    // 0 = full accent colours (word stages), 1 = fully settled to ink (star
+    // stages onward — the orbit inherits the star's settled ink).
     const starPresence =
       stage.kind === "toStar"
         ? this.clamp(stage.mix * 1.4, 0, 1)
-        : stage.kind === "starHold"
+        : stage.kind === "starHold" || inOrbit
           ? 1
           : 0;
     const repelStrength = props.cursorRepel ?? 1;
@@ -759,6 +1076,79 @@ export class SpiralEngine {
     const inStar = stage.kind === "toStar" || stage.kind === "starHold";
     if (inStar) this.starFrame(elapsed);
     if (starPresence >= 0.999) ctx.fillStyle = this.INK; // fully settled: skip per-dot colour lookups
+
+    if (inOrbit && this.orbitGroups) {
+      this.starFrame(elapsed); // the un-detached remainder is still a star
+      this.orbitFrame(elapsed, stage.kind === "toOrbit" ? stage.mix : 1);
+      ctx.fillStyle = this.INK;
+
+      const dot = (x, y, r) => {
+        const rr = Math.max(0.45, r);
+        if (rr < 1.6) {
+          ctx.fillRect(x - rr, y - rr, rr * 2, rr * 2);
+        } else {
+          ctx.beginPath();
+          ctx.arc(x, y, rr, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      };
+
+      const drawPiece = (k) => {
+        const f = this._orbitFrames[k];
+        const stay = 1 - f.e;
+        ctx.globalAlpha = this.lerp(1, f.alpha, f.e);
+        for (const { sub } of this.orbitGroups[k]) {
+          const op = this.orbitDotPos(sub, f);
+          // orbitDotPos lands on the dot's *resting* star position at e=0,
+          // but the attached star also sways (starPointFor). Carry that sway
+          // across as a decaying offset so a piece doesn't visibly snap the
+          // instant it starts to leave.
+          let x = op.x,
+            y = op.y;
+          if (stay > 0.001) {
+            const anim = this.starPointFor(sub, elapsed);
+            x += (anim.x - (this.starCx + sub.r0 * Math.cos(sub.theta))) * stay;
+            y += (anim.y - (this.starCy + sub.r0 * Math.sin(sub.theta))) * stay;
+          }
+          const rp = this.repelFromPointer(sub, x, y, repelStrength, repelR, 1);
+          dot(rp.x, rp.y, sub.dotR * op.scale);
+        }
+      };
+
+      // The core and the spikes that never leave — drawn in plain star
+      // formation, which is what keeps the star looking intact throughout.
+      const drawResidue = () => {
+        ctx.globalAlpha = 1;
+        for (const { sub } of this.orbitResidue) {
+          const sp = this.starPointFor(sub, elapsed);
+          const rp = this.repelFromPointer(
+            sub,
+            sp.x,
+            sp.y,
+            repelStrength,
+            repelR,
+            1,
+          );
+          dot(rp.x, rp.y, sub.dotR);
+        }
+      };
+
+      // Far pieces, then the star core, then near pieces — the whole reason
+      // the tilted ring reads as 3D rather than a flat overlapping mess.
+      let residueDrawn = false;
+      for (const k of this._orbitOrder) {
+        if (!residueDrawn && this._orbitFrames[k].z <= 0) {
+          drawResidue();
+          residueDrawn = true;
+        }
+        drawPiece(k);
+      }
+      if (!residueDrawn) drawResidue();
+
+      ctx.globalAlpha = 1;
+      this.raf = requestAnimationFrame(this.loop);
+      return;
+    }
 
     for (let i = 0; i < this.particles.length; i++) {
       const p = this.particles[i];
@@ -784,30 +1174,16 @@ export class SpiralEngine {
             y = sp.y;
             r = sub.dotR;
           }
-          // Cursor repel: push dots within repelR away from the pointer,
-          // smoothed (sub.rox/roy) so the push eases in/out instead of snapping.
-          let tox = 0,
-            toy = 0;
-          if (this.pointer.active && repelStrength > 0) {
-            const dx = x - this.pointer.x,
-              dy = y - this.pointer.y;
-            const d = Math.hypot(dx, dy);
-            if (d < repelR) {
-              const f = Math.pow(1 - d / repelR, 1.7);
-              const push = f * repelR * 0.62 * repelStrength * starPresence;
-              if (d > 0.001) {
-                tox = (dx / d) * push;
-                toy = (dy / d) * push;
-              } else {
-                tox = Math.cos(sub.ph) * push;
-                toy = Math.sin(sub.ph) * push;
-              } // dot is exactly under the cursor
-            }
-          }
-          sub.rox += (tox - sub.rox) * 0.16;
-          sub.roy += (toy - sub.roy) * 0.16;
-          x += sub.rox;
-          y += sub.roy;
+          const rp = this.repelFromPointer(
+            sub,
+            x,
+            y,
+            repelStrength,
+            repelR,
+            starPresence,
+          );
+          x = rp.x;
+          y = rp.y;
           if (starPresence < 0.999) {
             ctx.fillStyle =
               p.colorSlot === -1

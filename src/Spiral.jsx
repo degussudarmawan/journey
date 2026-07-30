@@ -4,9 +4,10 @@ import { SketchLayer } from "./sketchLayer";
 
 /**
  * Scroll-driven dot animation: a resting grid explodes into a spiral, spells
- * out word1/word2/word3/word4 one at a time, then reforms into an eight-point
- * starburst that reacts to the cursor. See spiralEngine.js for how it works
- * and what to tweak.
+ * out word1/word2/word3/word4 one at a time, reforms into an eight-point
+ * starburst that reacts to the cursor, and finally breaks apart into six
+ * needle rays orbiting the centre on a tilted 3D track. See spiralEngine.js
+ * for how it works and what to tweak.
  *
  * All the heavy lifting (canvas drawing, requestAnimationFrame loop, scroll
  * listener) is deliberately kept in SpiralEngine, a plain JS class, rather
@@ -48,7 +49,9 @@ export default function Spiral({
     [word1, word2, word3, word4].filter(
       (w) => typeof w === "string" && w.trim().length > 0,
     ).length || 3;
-  const trackHeightVh = 100 + wordCount * 200;
+  // + 200vh for the closing star -> orbit act, so adding it didn't squeeze
+  // every earlier stage into less scroll than before.
+  const trackHeightVh = 100 + wordCount * 200 + 200;
 
   // "Latest props" ref: the render loop reads props.current every frame
   // instead of closing over a stale value, so prop changes take effect
@@ -77,22 +80,23 @@ export default function Spiral({
     engineRef.current = engine;
     engine.mount();
 
-    // The doodle layer only accepts new strokes once the starburst has
-    // fully settled (the last stage) — mid-transition drawing would be
-    // fighting with dots that are still moving into place.
-    const isStarHold = () => {
+    // The doodle layer only accepts new strokes on the "settled" stages —
+    // the held starburst and the orbiting rays after it. Mid-transition
+    // drawing would be fighting with dots still moving into place.
+    const isSketchable = () => {
       const eng = engineRef.current;
       if (!eng || !eng.stageDefs) return false;
-      return eng.getStage(eng.scrollT).kind === "starHold";
+      const kind = eng.getStage(eng.scrollT).kind;
+      return kind === "starHold" || kind === "orbitHold";
     };
-    const sketch = new SketchLayer(sketchCanvasRef.current, isStarHold);
+    const sketch = new SketchLayer(sketchCanvasRef.current, isSketchable);
     sketchRef.current = sketch;
     sketch.mount();
 
     // Keeps the Clear button's visibility (canDraw) in sync with scroll —
-    // same underlying check as isStarHold above, just also pushed into
+    // same underlying check as isSketchable above, just also pushed into
     // React state so the button can be styled declaratively.
-    const onScroll = () => setCanDraw(isStarHold());
+    const onScroll = () => setCanDraw(isSketchable());
     window.addEventListener("scroll", onScroll, { passive: true });
     onScroll();
 

@@ -65,6 +65,7 @@
 
 import { keyForSpike } from "./keys";
 import { drawKey3D, sampleKeyLocalPoints } from "./keyRenderer";
+import { buildDoorArt, drawDoor } from "./door";
 
 export const DEFAULT_PALETTE = ["#c98a8a", "#8aa8c9", "#8ec9a6", "#b98ac9"];
 
@@ -110,6 +111,9 @@ export class SpiralEngine {
 
     this.selectedSlot = null; // index into orbitSlots, once a key is chosen
     this.selectedKey = null;
+    this.unlocking = false;
+    this.doorArt = null;
+    this.onUnlocked = null; // set by the host; fires when the door finishes opening
   }
 
   // ---- Small math helpers -----------------------------------------------
@@ -682,6 +686,23 @@ export class SpiralEngine {
   KEY_FIT = 1.05; // key height as a multiple of the needle it replaces
   KEY_PICK_RADIUS = 80; // click tolerance around a piece's axis, screen px
 
+  // ---- Unlock sequence --------------------------------------------------------
+  // Clicking an already-formed key runs the whole unlock: the rest of the ring
+  // clears out, a door rises behind, the key flies to the keyhole, turns, and
+  // the door swings open. All of it is driven off one 0..1 progress value, so
+  // the phases below just carve up that range and overlap where a hand-off
+  // should feel continuous.
+  UNLOCK_SECS = 4.6;
+  U_CLEAR = [0.0, 0.2]; // other pieces sweep off screen
+  U_DOOR_IN = [0.02, 0.26]; // door fades up behind them
+  U_FLIGHT = [0.16, 0.52]; // key travels to the keyhole and turns face-on
+  U_INSERT = [0.52, 0.63]; // key seats into the hole
+  U_TURN = [0.63, 0.79]; // key rotates — the actual unlocking
+  U_SWING = [0.79, 1.0]; // door opens
+  KEY_DOOR_SCALE = 0.15; // key height at the door, as a fraction of min(w,h)
+  KEY_PIVOT_Y = 0.72; // point along the key (local units) that enters the hole
+  KEY_TURN_ANGLE = Math.PI * 0.46; // how far the key rotates to unlock
+
   // Partitions every halftone dot into its spike and records it in that
   // spike's local 3D frame. Dots belonging to spikes not listed in
   // ORBIT_SPIKES stay in star formation forever (orbitResidue).
@@ -1017,6 +1038,120 @@ export class SpiralEngine {
     return this.clamp((elapsed - this._selectT0) / this.KEY_MORPH_SECS, 0, 1);
   }
 
+  /** Begins the unlock. Only valid on a key that has finished forming. */
+  startUnlock(elapsed) {
+    if (this.unlocking) return;
+    this.unlocking = true;
+    this._unlockT0 = elapsed;
+    this._unlockFired = false;
+    this.ensureDoorArt();
+  }
+
+  /** 0 until the unlock starts, then ramps to 1 as the door finishes opening. */
+  unlockProgress(elapsed) {
+    if (!this.unlocking) return 0;
+    return this.clamp((elapsed - this._unlockT0) / this.UNLOCK_SECS, 0, 1);
+  }
+
+  /** Tears the whole sequence down, back to a plain orbiting ring. */
+  resetUnlock() {
+    this.unlocking = false;
+    this._unlockFired = false;
+    this.selectedSlot = null;
+    this.selectedKey = null;
+  }
+
+  // The door art is costly to paint and never changes, so it's built once for
+  // the current viewport and thrown away only on resize.
+  ensureDoorArt() {
+    const { w, h } = this.dims;
+    if (this.doorArt && this.doorArt.W === w && this.doorArt.H === h) return;
+    this.doorArt = buildDoorArt(w, h, this.selectedKey?.doorText || "");
+  }
+
+  // Eases a phase window into its own 0..1, so each step of the sequence can
+  // be written against its own local progress.
+  phase(u, range) {
+    return this.smoothstep(range[0], range[1], u);
+  }
+
+  // The key's frame during the unlock: it starts exactly where the orbiting
+  // piece is and ends face-on at the keyhole, turned. Interpolating the FRAME
+  // (origin, axes, scale) rather than each point keeps the key rigid — a
+  // straight per-point lerp would squash it flat halfway through, since the
+  // start and end orientations are far apart.
+  keyUnlockProject(f, u) {
+    const { w, h } = this.dims;
+    const len = f.slot.needleLen;
+
+    // Start: the key riding its piece, expressed as an origin plus three axes.
+    const startScale = (len / 2.4) * this.KEY_FIT;
+    const la = len / 2 - f.slot.anchorAlong;
+    const o0 = [
+      f.px + la * f.ax,
+      f.py + la * f.ay,
+      f.pz + la * f.az,
+    ];
+    const x0 = [f.cx, f.cy, f.cz];
+    const y0 = [-f.ax, -f.ay, -f.az]; // key y is down; needle `along` runs out
+    const z0 = [f.ux, f.uy, f.uz];
+
+    // End: square to the screen at the keyhole, rotated by the turn.
+    const turn = this.phase(u, this.U_TURN) * this.KEY_TURN_ANGLE;
+    const ct = Math.cos(turn),
+      st = Math.sin(turn);
+    const x1 = [ct, st, 0];
+    const y1 = [-st, ct, 0];
+    const z1 = [0, 0, 1];
+    const endScale = (Math.min(w, h) * this.KEY_DOOR_SCALE) / 2.4;
+    // Place the key so its pivot point lands in the keyhole (world origin is
+    // screen centre, which is where the keyhole is), then push it inward as it
+    // seats. Because the pivot offset is expressed along the *rotated* y axis,
+    // the key swings around the keyhole rather than about its own middle.
+    const seat = this.phase(u, this.U_INSERT) * endScale * 0.5;
+    const o1 = [
+      -endScale * this.KEY_PIVOT_Y * y1[0],
+      -endScale * this.KEY_PIVOT_Y * y1[1],
+      seat,
+    ];
+
+    const t = this.phase(u, this.U_FLIGHT);
+    const mix3 = (a, b) => {
+      const v = [
+        this.lerp(a[0], b[0], t),
+        this.lerp(a[1], b[1], t),
+        this.lerp(a[2], b[2], t),
+      ];
+      const l = Math.hypot(v[0], v[1], v[2]) || 1;
+      return [v[0] / l, v[1] / l, v[2] / l];
+    };
+    const O = [
+      this.lerp(o0[0], o1[0], t),
+      this.lerp(o0[1], o1[1], t),
+      this.lerp(o0[2], o1[2], t),
+    ];
+    const X = mix3(x0, x1);
+    const Y = mix3(y0, y1);
+    const Z = mix3(z0, z1);
+    const s = this.lerp(startScale, endScale, t);
+
+    return (kx, ky, kz) => {
+      const ax = kx * s,
+        ay = ky * s,
+        az = kz * s;
+      const wx = O[0] + ax * X[0] + ay * Y[0] + az * Z[0];
+      const wy = O[1] + ax * X[1] + ay * Y[1] + az * Z[1];
+      const wz = O[2] + ax * X[2] + ay * Y[2] + az * Z[2];
+      const persp = this.orbitPersp(wz);
+      return {
+        x: this.orbitCx + wx * persp,
+        y: this.orbitCy + wy * persp,
+        scale: persp,
+        z: wz,
+      };
+    };
+  }
+
   // Cursor repel, shared by the star and orbit stages: pushes a dot away
   // from the pointer within `radius`, smoothed through sub.rox/roy so the
   // push eases in and out instead of snapping.
@@ -1145,6 +1280,10 @@ export class SpiralEngine {
       this.buildGrid();
       this.rebuildWords();
       this.buildStar();
+      // Door art is painted to the old viewport size; drop it and let the
+      // unlock rebuild it on demand.
+      this.doorArt = null;
+      if (this.unlocking) this.ensureDoorArt();
     }, 200);
   }
 
@@ -1176,14 +1315,21 @@ export class SpiralEngine {
   // Picking a spike to turn into a key. Only live once the pieces have
   // finished detaching — clicking mid-flight would be a coin toss.
   onPointerDown(e) {
-    if (!this.canvas || !this.stageDefs) return;
+    if (!this.canvas || !this.stageDefs || this.unlocking) return;
     if (this.getStage(this.scrollT).kind !== "orbitHold") return;
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
     const elapsed = this._lastElapsed || 0;
+
     if (this.selectedSlot != null) {
-      this.selectPiece(-1, elapsed); // click anywhere to release the key
+      // Clicking the key itself runs the unlock; clicking away puts it back.
+      const hit = this.hitTestPieces(x, y);
+      if (hit === this.selectedSlot && this.selectProgress(elapsed) >= 1) {
+        this.startUnlock(elapsed);
+      } else {
+        this.selectPiece(-1, elapsed);
+      }
       return;
     }
     this.selectPiece(this.hitTestPieces(x, y), elapsed);
@@ -1268,11 +1414,30 @@ export class SpiralEngine {
       const dotsFade = 1 - this.smoothstep(0.2, 0.72, sel);
       const keyFade = this.smoothstep(0.45, 0.95, sel);
 
+      // Unlock sequence. The door goes down first so everything else layers
+      // over it, and the pieces still on the ring sweep away as it rises.
+      const u = this.unlockProgress(elapsed);
+      if (u > 0 && this.doorArt) {
+        const doorIn = this.phase(u, this.U_DOOR_IN);
+        const swing = this.phase(u, this.U_SWING);
+        ctx.save();
+        ctx.globalAlpha = doorIn;
+        drawDoor(ctx, this.doorArt, w, h, swing, 1 - this.phase(u, this.U_SWING));
+        ctx.restore();
+      }
+      const clearOut = this.phase(u, this.U_CLEAR);
+
       const drawPiece = (k) => {
         const f = this._orbitFrames[k];
         const stay = 1 - f.e;
         const chosen = k === this.selectedSlot && sel > 0;
-        const keyProject = chosen ? this.keyProjectForPiece(f) : null;
+        // Once unlocking, the chosen key leaves its orbit frame and flies the
+        // scripted path to the keyhole.
+        const keyProject = chosen
+          ? u > 0
+            ? this.keyUnlockProject(f, u)
+            : this.keyProjectForPiece(f)
+          : null;
         // Cursor repel is deliberately not applied during the orbit: the
         // pointer's job here is picking a spike, and dots dodging it fought
         // with that.
@@ -1300,6 +1465,16 @@ export class SpiralEngine {
             x = this.lerp(x, kp.x, gather);
             y = this.lerp(y, kp.y, gather);
             alpha *= dotsFade;
+          } else if (clearOut > 0) {
+            // Everything that isn't the chosen key is flung out of frame,
+            // away from the centre, clearing the stage for the door.
+            const dx = x - cx,
+              dy = y - cy;
+            const d = Math.hypot(dx, dy) || 1;
+            const push = clearOut * Math.max(w, h) * 1.15;
+            x += (dx / d) * push;
+            y += (dy / d) * push;
+            alpha *= 1 - clearOut;
           } else if (k === this.hoverSlot) {
             // Hovering a spike that has a key: thicken and darken it so it
             // reads as the interactive one.
@@ -1323,11 +1498,19 @@ export class SpiralEngine {
 
         // Drawn here, inside the piece's turn, so the solid key keeps its
         // place in the ring's far-to-near ordering like any other piece.
-        if (chosen && keyFade > 0.004) {
+        // The key rides in the lock, so it goes with the door: fade it out as
+        // the leaves swing rather than leaving it hanging in the gap.
+        const keyAlpha = keyFade * (1 - this.phase(u, this.U_SWING));
+        if (chosen && keyAlpha > 0.004) {
           const mid = keyProject(0, 0, 0); // key centre, for depth-scaled linework
+          const lineScale = this.lerp(
+            f.slot.needleLen * 0.006,
+            Math.min(w, h) * 0.0016,
+            this.phase(u, this.U_FLIGHT),
+          );
           drawKey3D(ctx, this.selectedKey, keyProject, {
-            alpha: keyFade,
-            outlineWidth: Math.max(1, f.slot.needleLen * 0.006 * mid.scale),
+            alpha: keyAlpha,
+            outlineWidth: Math.max(1, lineScale * mid.scale),
           });
         }
       };
@@ -1353,6 +1536,12 @@ export class SpiralEngine {
         drawPiece(k);
       }
       if (!residueDrawn) drawResidue();
+
+      // The door has finished swinging: hand off to whatever shows the page.
+      if (u >= 1 && !this._unlockFired) {
+        this._unlockFired = true;
+        this.onUnlocked?.(this.selectedKey?.id);
+      }
 
       ctx.globalAlpha = 1;
       this.raf = requestAnimationFrame(this.loop);

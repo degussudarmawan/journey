@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { SpiralEngine, DEFAULT_PALETTE } from "./spiralEngine";
 import { SketchLayer } from "./sketchLayer";
+import KeyPage from "./KeyPage";
 
 /**
  * Scroll-driven dot animation: a resting grid explodes into a spiral, spells
@@ -40,6 +41,8 @@ export default function Spiral({
   // the Clear button's visibility declaratively instead of fighting React
   // for control of the DOM via an imperative style mutation.
   const [canDraw, setCanDraw] = useState(false);
+  // Set once a key's door has finished opening; holds that key's id.
+  const [unlockedKey, setUnlockedKey] = useState(null);
 
   // How many words are actually active (mirrors the filtering rebuildWords()
   // does in spiralEngine.js) — used to size the scroll track so each word
@@ -78,6 +81,8 @@ export default function Spiral({
       () => propsRef.current,
     );
     engineRef.current = engine;
+    // Fires when the door has finished swinging open.
+    engine.onUnlocked = (keyId) => setUnlockedKey(keyId ?? "unknown");
     engine.mount();
 
     // Sketching is parked for now — it's headed for one of the key pages
@@ -209,6 +214,17 @@ export default function Spiral({
           </div>
         </div>
       </div>
+      {unlockedKey && (
+        <KeyPage
+          keyId={unlockedKey}
+          onBack={() => {
+            // Reset the engine too, or the door stays open on the canvas
+            // behind the page we're dismissing.
+            engineRef.current?.resetUnlock();
+            setUnlockedKey(null);
+          }}
+        />
+      )}
     </div>
   );
 }

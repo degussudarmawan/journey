@@ -63,6 +63,9 @@
                                 perspective strength, detach stagger
    ============================================================================ */
 
+import { keyForSpike } from "./keys";
+import { drawKey3D, sampleKeyLocalPoints } from "./keyRenderer";
+
 export const DEFAULT_PALETTE = ["#c98a8a", "#8aa8c9", "#8ec9a6", "#b98ac9"];
 
 export class SpiralEngine {
@@ -102,7 +105,11 @@ export class SpiralEngine {
     this.onResize = this.onResize.bind(this);
     this.onPointerMove = this.onPointerMove.bind(this);
     this.onPointerLeave = this.onPointerLeave.bind(this);
+    this.onPointerDown = this.onPointerDown.bind(this);
     this.loop = this.loop.bind(this);
+
+    this.selectedSlot = null; // index into orbitSlots, once a key is chosen
+    this.selectedKey = null;
   }
 
   // ---- Small math helpers -----------------------------------------------
@@ -643,16 +650,37 @@ export class SpiralEngine {
   // Listed in detach order: starts with the long bottom ray, then sweeps
   // around the circle. Drop entries here to keep those spikes on the star.
   ORBIT_SPIKES = [5, 6, 7, 0, 1, 2, 3, 4];
-  ORBIT_TILT_DEG = 72; // 0 = flat circle facing the viewer, 90 = fully edge-on
+  ORBIT_TILT_DEG = 62; // 0 = flat circle facing the viewer, 90 = fully edge-on
   ORBIT_SPEED = 0.32; // orbital angular speed, rad/s
   ORBIT_RADIUS_FRAC = 0.3; // orbit radius, as a fraction of min(w,h)
-  ORBIT_FOCAL = 900; // perspective focal length in px — smaller = stronger depth
+  ORBIT_FOCAL = 520; // perspective focal length in px — smaller = stronger depth
   ORBIT_UNDULATE = 0.15; // vertical rise/fall of the track, as a fraction of radius
-  ORBIT_ANCHOR = 0.15; // point along a spike that rides the track (0 = base, 1 = tip) — low so upright pieces stand on the ring
+  // Which point along a spike rides the track (0 = base, 1 = tip). 0.5 centres
+  // each needle on the ring; because the pieces stand upright, a low value
+  // instead pushes all their mass above the ring and the whole composition
+  // drifts up out of frame.
+  ORBIT_ANCHOR = 0.5;
   ORBIT_DETACH_WINDOW = 0.42; // fraction of the toOrbit stage one piece's flight takes
-  ORBIT_DEPTH_FADE = 2.2; // how much far pieces fade; 0 = no depth fade
-  ORBIT_MIN_ALPHA = 0.3; // floor on that fade, so far pieces never vanish
-  ORBIT_THICKNESS = 1; // multiplier on each needle's out-of-plane thickness
+  ORBIT_DEPTH_FADE = 2.2; // how much far dots fade; 0 = no depth shading
+  ORBIT_MIN_ALPHA = 0.3; // floor on that fade, so far dots never vanish
+  ORBIT_THICKNESS = 1.5; // multiplier on each needle's cross-section thickness
+  // How far each needle tips outward from the ring's normal, in degrees.
+  // This one matters more than it looks: at 0 every needle points along the
+  // normal, which is the SAME direction everywhere on the ring — so the
+  // pieces stay permanently parallel, never rotate, and the whole thing reads
+  // flat no matter how strong the perspective is. Leaning them outward makes
+  // each one's axis swing through 3D as it orbits, which is what actually
+  // sells the depth. 90 would lay them flat in the orbital plane.
+  ORBIT_LEAN_DEG = 38;
+
+  // ---- Key transformation -----------------------------------------------------
+  // Clicking an orbiting spike that has a key registered for it (see
+  // src/keys/index.js) morphs that piece into a solid 3D key: the piece
+  // freezes where it is, its dots gather into the key's silhouette and fade,
+  // and the solid key fades in over them.
+  KEY_MORPH_SECS = 1.3; // how long the whole dots -> solid key morph takes
+  KEY_FIT = 1.05; // key height as a multiple of the needle it replaces
+  KEY_PICK_RADIUS = 80; // click tolerance around a piece's axis, screen px
 
   // Partitions every halftone dot into its spike and records it in that
   // spike's local 3D frame. Dots belonging to spikes not listed in
@@ -737,6 +765,14 @@ export class SpiralEngine {
     this.orbitResidue = residue;
   }
 
+  // Perspective factor for a given depth. The denominator is floored so a
+  // large ORBIT_RADIUS_FRAC against a short ORBIT_FOCAL can't drive a near
+  // piece through the camera and invert (or explode) its projection.
+  orbitPersp(z) {
+    const f = this.ORBIT_FOCAL;
+    return f / Math.max(f * 0.25, f + z);
+  }
+
   // Per-frame, per-piece state: computed once per piece here rather than per
   // halftone dot (there are thousands of those). Builds each piece's full 3D
   // frame — pivot plus three axis vectors — interpolated from "attached and
@@ -754,10 +790,13 @@ export class SpiralEngine {
     this.orbitCy = h / 2;
 
     // The orbital plane is spanned by e1 = (1,0,0) and e2 = (0,cosT,sinT), so
-    // its normal — the axis a needle's thickness sticks out along — is:
+    // its normal — the "upright" direction the pieces stand along — is:
     const nx = 0,
       ny = -sinT,
       nz = cosT;
+    const lean = (this.ORBIT_LEAN_DEG * Math.PI) / 180;
+    const cosL = Math.cos(lean),
+      sinL = Math.sin(lean);
 
     // Stagger so pieces leave one after another, the last finishing just as
     // the stage ends. They overlap slightly, which reads more naturally than
@@ -816,23 +855,31 @@ export class SpiralEngine {
       pose.py = this.lerp(sy, ty, e);
       pose.pz = tz * e;
 
+      // The needle's long axis: the ring's normal, tipped outward toward the
+      // radial direction by ORBIT_LEAN_DEG, so the pieces stand upright-ish
+      // but splay outward like a crown. Because the radial direction rotates
+      // as a piece travels round the ring, its long axis genuinely swings
+      // through 3D — that rotation is the main thing making it read solid.
+      const gx = cosL * nx + sinL * bx,
+        gy = cosL * ny + sinL * by,
+        gz = cosL * nz + sinL * bz;
+      // The remaining perpendicular, in the same normal/radial plane — this is
+      // the axis the cross-section's thickness sticks out along.
+      const hx = -sinL * nx + cosL * bx,
+        hy = -sinL * ny + cosL * by,
+        hz = -sinL * nz + cosL * bz;
+
       // Axis vectors, normalised-lerped between the two frames. Close enough
       // to a proper slerp over this short a flight, and far cheaper.
-      //
-      // The needle's long axis ends up along the ring's NORMAL, so the pieces
-      // stand upright out of the orbital plane rather than lying along their
-      // direction of travel. (Swap the `n*` and `d*` vectors between the two
-      // blocks below to lay them along the track instead.) With the ring
-      // tilted, the normal is very close to screen-vertical, so they read as
-      // standing pins that lean slightly with perspective.
-      let axx = this.lerp(fx, nx, e),
-        axy = this.lerp(fy, ny, e),
-        axz = nz * e;
+      let axx = this.lerp(fx, gx, e),
+        axy = this.lerp(fy, gy, e),
+        axz = gz * e;
       const al = Math.hypot(axx, axy, axz) || 1;
       pose.ax = axx / al;
       pose.ay = axy / al;
       pose.az = axz / al;
 
+      // Width runs along the direction of travel.
       let cxx = this.lerp(-fy, dx, e),
         cyy = this.lerp(fx, dy, e),
         czz = dz * e;
@@ -841,21 +888,11 @@ export class SpiralEngine {
       pose.cy = cyy / cl;
       pose.cz = czz / cl;
 
-      // Thickness sticks out along the remaining axis (radially, in-plane).
-      pose.ux = bx;
-      pose.uy = by;
-      pose.uz = bz;
+      pose.ux = hx;
+      pose.uy = hy;
+      pose.uz = hz;
       pose.slot = slot;
       pose.z = tz * e; // for coarse piece-level depth ordering
-
-      // Depth fade, keyed off the track point so it stays constant across the
-      // piece (per-dot alpha would mean thousands of canvas state changes).
-      const trackPersp = this.ORBIT_FOCAL / (this.ORBIT_FOCAL + pose.z);
-      pose.alpha = this.clamp(
-        1 - (1 - trackPersp) * this.ORBIT_DEPTH_FADE,
-        this.ORBIT_MIN_ALPHA,
-        1,
-      );
     }
 
     this._orbitOrder = frames
@@ -874,12 +911,110 @@ export class SpiralEngine {
     const x = f.px + la * f.ax + lc * f.cx + lu * f.ux;
     const y = f.py + la * f.ay + lc * f.cy + lu * f.uy;
     const z = f.pz + la * f.az + lc * f.cz + lu * f.uz;
-    const persp = this.ORBIT_FOCAL / (this.ORBIT_FOCAL + z);
+    const persp = this.orbitPersp(z);
     return {
       x: this.orbitCx + x * persp,
       y: this.orbitCy + y * persp,
       scale: persp,
+      z,
     };
+  }
+
+  // ---- Key selection ----------------------------------------------------------
+
+  // Which orbiting piece is under a screen point, or -1. Each piece is tested
+  // as a thick line down its own axis: sample a few points along the needle,
+  // project them, and measure the click against those segments. Far cheaper
+  // and steadier than testing thousands of individual dots, and a needle is
+  // near enough to a line for picking.
+  hitTestPieces(px, py, keyedOnly = false) {
+    if (!this._orbitFrames || !this.orbitSlots) return -1;
+    const probe = { rayAcross: 0, rayUp: 0, rayAlong: 0 };
+    let best = -1;
+    let bestScore = 1; // normalised distance; < 1 counts as a hit
+    for (let k = 0; k < this._orbitFrames.length; k++) {
+      // Skip spikes with no key registered, so hover only ever highlights
+      // something that will actually respond to a click.
+      if (keyedOnly && !keyForSpike(this.orbitSlots[k].spikeIdx)) continue;
+      const f = this._orbitFrames[k];
+      const len = f.slot.needleLen;
+      let prev = null;
+      for (let s = 0; s <= 6; s++) {
+        probe.rayAlong = (s / 6) * len;
+        const q = this.orbitDotPos(probe, f);
+        if (prev) {
+          const d = this.distToSegment(px, py, prev.x, prev.y, q.x, q.y);
+          // Tolerance follows the piece's perspective scale, so a near piece
+          // is as easy to hit as a far one.
+          const tol = this.KEY_PICK_RADIUS * ((prev.scale + q.scale) / 2);
+          const score = d / tol;
+          if (score < bestScore) {
+            bestScore = score;
+            best = k;
+          }
+        }
+        prev = q;
+      }
+    }
+    return best;
+  }
+
+  distToSegment(px, py, x0, y0, x1, y1) {
+    const dx = x1 - x0,
+      dy = y1 - y0;
+    const len2 = dx * dx + dy * dy;
+    let t = len2 > 0 ? ((px - x0) * dx + (py - y0) * dy) / len2 : 0;
+    t = this.clamp(t, 0, 1);
+    return Math.hypot(px - (x0 + dx * t), py - (y0 + dy * t));
+  }
+
+  /** Begins the morph for piece `k`, or clears the selection when passed -1. */
+  selectPiece(k, elapsed) {
+    if (k < 0) {
+      this.selectedSlot = null;
+      return;
+    }
+    const spikeIdx = this.orbitSlots[k].spikeIdx;
+    const def = keyForSpike(spikeIdx);
+    if (!def) return; // this spike has no key yet — leave it orbiting
+    this.selectedSlot = k;
+    this.selectedKey = def;
+    this._selectT0 = elapsed;
+
+    // Give each of this piece's dots a destination inside the key outline.
+    const group = this.orbitGroups[k];
+    const pts = sampleKeyLocalPoints(def, group.length, (i) =>
+      this.hash(i * 3.71 + 0.7),
+    );
+    group.forEach((ref, i) => {
+      ref.sub.keyLocal = pts[i];
+    });
+  }
+
+  // Maps the key's own 2D space into a piece's 3D frame, so the key rides the
+  // ring exactly where its needle was — same position, tilt and depth. The
+  // key replaces the needle in place; it never leaves the orbit.
+  //
+  // The key is authored y-down with its bow at the top, and a needle's `along`
+  // axis runs outward from the ring's centre, so key y maps to NEGATIVE along
+  // — that puts the bow at the needle's outer tip.
+  keyProjectForPiece(f) {
+    const len = f.slot.needleLen;
+    const scale = (len / 2.4) * this.KEY_FIT; // key geometry is 2.4 units tall
+    const centerAlong = len / 2; // sit the key's middle at the needle's middle
+    const probe = { rayAlong: 0, rayAcross: 0, rayUp: 0 };
+    return (kx, ky, kz) => {
+      probe.rayAlong = centerAlong - ky * scale;
+      probe.rayAcross = kx * scale;
+      probe.rayUp = kz * scale;
+      return this.orbitDotPos(probe, f);
+    };
+  }
+
+  /** 0 while nothing is selected, ramping to 1 as the morph completes. */
+  selectProgress(elapsed) {
+    if (this.selectedSlot == null) return 0;
+    return this.clamp((elapsed - this._selectT0) / this.KEY_MORPH_SECS, 0, 1);
   }
 
   // Cursor repel, shared by the star and orbit stages: pushes a dot away
@@ -993,6 +1128,7 @@ export class SpiralEngine {
     window.addEventListener("pointerdown", this.onPointerMove, {
       passive: true,
     });
+    window.addEventListener("pointerdown", this.onPointerDown);
     window.addEventListener("pointerleave", this.onPointerLeave);
     window.addEventListener("blur", this.onPointerLeave);
     this.onScroll();
@@ -1019,10 +1155,38 @@ export class SpiralEngine {
     this.pointer.x = e.clientX - rect.left;
     this.pointer.y = e.clientY - rect.top;
     this.pointer.active = true;
+
+    // Track which keyed spike is under the cursor, so hovering one can show
+    // it's clickable. Without this the whole interaction is invisible: most
+    // spikes have no key yet and clicking them does nothing at all.
+    const live =
+      this.stageDefs &&
+      this.getStage(this.scrollT).kind === "orbitHold" &&
+      this.selectedSlot == null;
+    this.hoverSlot = live
+      ? this.hitTestPieces(this.pointer.x, this.pointer.y, true)
+      : -1;
+    this.canvas.style.cursor = this.hoverSlot >= 0 ? "pointer" : "";
   }
 
   onPointerLeave() {
     if (this.pointer) this.pointer.active = false;
+  }
+
+  // Picking a spike to turn into a key. Only live once the pieces have
+  // finished detaching — clicking mid-flight would be a coin toss.
+  onPointerDown(e) {
+    if (!this.canvas || !this.stageDefs) return;
+    if (this.getStage(this.scrollT).kind !== "orbitHold") return;
+    const rect = this.canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const elapsed = this._lastElapsed || 0;
+    if (this.selectedSlot != null) {
+      this.selectPiece(-1, elapsed); // click anywhere to release the key
+      return;
+    }
+    this.selectPiece(this.hitTestPieces(x, y), elapsed);
   }
 
   // Converts the track element's scroll position into this.scrollT (0..1),
@@ -1049,6 +1213,7 @@ export class SpiralEngine {
   loop(ts) {
     if (!this.startTime) this.startTime = ts;
     const elapsed = (ts - this.startTime) / 1000;
+    this._lastElapsed = elapsed; // pointer handlers need the animation clock
     const ctx = this.ctx;
     const { w, h } = this.dims;
     ctx.clearRect(0, 0, w, h);
@@ -1093,25 +1258,77 @@ export class SpiralEngine {
         }
       };
 
+      // Morph state for the piece being turned into a key (0 when none is).
+      // The key takes the needle's place inside the ring — same spot, same
+      // orbit, new form — so nothing here moves or pauses the rest of the
+      // scene. Dots travel into the key's outline first, then hand over to
+      // the solid shape; the two crossfade so no frame shows neither.
+      const sel = this.selectProgress(elapsed);
+      const gather = this.smoothstep(0, 0.75, sel);
+      const dotsFade = 1 - this.smoothstep(0.2, 0.72, sel);
+      const keyFade = this.smoothstep(0.45, 0.95, sel);
+
       const drawPiece = (k) => {
         const f = this._orbitFrames[k];
         const stay = 1 - f.e;
-        ctx.globalAlpha = this.lerp(1, f.alpha, f.e);
+        const chosen = k === this.selectedSlot && sel > 0;
+        const keyProject = chosen ? this.keyProjectForPiece(f) : null;
+        // Cursor repel is deliberately not applied during the orbit: the
+        // pointer's job here is picking a spike, and dots dodging it fought
+        // with that.
         for (const { sub } of this.orbitGroups[k]) {
           const op = this.orbitDotPos(sub, f);
+          let x = op.x,
+            y = op.y,
+            r = sub.dotR * op.scale;
+          // Shade each dot by its OWN depth, not the piece's. A single alpha
+          // per piece leaves every needle internally flat; a gradient across
+          // one needle is what actually shows its volume and which way it's
+          // pointing. Attached pieces stay fully opaque, like the star.
+          let alpha = this.lerp(
+            1,
+            this.clamp(
+              1 - (1 - op.scale) * this.ORBIT_DEPTH_FADE,
+              this.ORBIT_MIN_ALPHA,
+              1,
+            ),
+            f.e,
+          );
+
+          if (chosen && sub.keyLocal) {
+            const kp = keyProject(sub.keyLocal.x, sub.keyLocal.y, 0);
+            x = this.lerp(x, kp.x, gather);
+            y = this.lerp(y, kp.y, gather);
+            alpha *= dotsFade;
+          } else if (k === this.hoverSlot) {
+            // Hovering a spike that has a key: thicken and darken it so it
+            // reads as the interactive one.
+            alpha = Math.min(1, alpha * 1.6);
+            r *= 1.3;
+          }
+
           // orbitDotPos lands on the dot's *resting* star position at e=0,
           // but the attached star also sways (starPointFor). Carry that sway
           // across as a decaying offset so a piece doesn't visibly snap the
           // instant it starts to leave.
-          let x = op.x,
-            y = op.y;
           if (stay > 0.001) {
             const anim = this.starPointFor(sub, elapsed);
             x += (anim.x - (this.starCx + sub.r0 * Math.cos(sub.theta))) * stay;
             y += (anim.y - (this.starCy + sub.r0 * Math.sin(sub.theta))) * stay;
           }
-          const rp = this.repelFromPointer(sub, x, y, repelStrength, repelR, 1);
-          dot(rp.x, rp.y, sub.dotR * op.scale);
+          if (alpha <= 0.004) continue;
+          ctx.globalAlpha = alpha;
+          dot(x, y, r);
+        }
+
+        // Drawn here, inside the piece's turn, so the solid key keeps its
+        // place in the ring's far-to-near ordering like any other piece.
+        if (chosen && keyFade > 0.004) {
+          const mid = keyProject(0, 0, 0); // key centre, for depth-scaled linework
+          drawKey3D(ctx, this.selectedKey, keyProject, {
+            alpha: keyFade,
+            outlineWidth: Math.max(1, f.slot.needleLen * 0.006 * mid.scale),
+          });
         }
       };
 
@@ -1121,15 +1338,7 @@ export class SpiralEngine {
         ctx.globalAlpha = 1;
         for (const { sub } of this.orbitResidue) {
           const sp = this.starPointFor(sub, elapsed);
-          const rp = this.repelFromPointer(
-            sub,
-            sp.x,
-            sp.y,
-            repelStrength,
-            repelR,
-            1,
-          );
-          dot(rp.x, rp.y, sub.dotR);
+          dot(sp.x, sp.y, sub.dotR);
         }
       };
 
@@ -1261,6 +1470,7 @@ export class SpiralEngine {
     window.removeEventListener("resize", this.onResize);
     window.removeEventListener("pointermove", this.onPointerMove);
     window.removeEventListener("pointerdown", this.onPointerMove);
+    window.removeEventListener("pointerdown", this.onPointerDown);
     window.removeEventListener("pointerleave", this.onPointerLeave);
     window.removeEventListener("blur", this.onPointerLeave);
   }

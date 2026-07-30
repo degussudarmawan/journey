@@ -80,15 +80,11 @@ export default function Spiral({
     engineRef.current = engine;
     engine.mount();
 
-    // The doodle layer only accepts new strokes on the "settled" stages —
-    // the held starburst and the orbiting rays after it. Mid-transition
-    // drawing would be fighting with dots still moving into place.
-    const isSketchable = () => {
-      const eng = engineRef.current;
-      if (!eng || !eng.stageDefs) return false;
-      const kind = eng.getStage(eng.scrollT).kind;
-      return kind === "starHold" || kind === "orbitHold";
-    };
+    // Sketching is parked for now — it's headed for one of the key pages
+    // instead of the main scroll. Leaving the layer mounted (just never
+    // active) keeps it a one-line change to bring back, and keeps it from
+    // fighting the orbit, where a click now picks a spike to turn into a key.
+    const isSketchable = () => false;
     const sketch = new SketchLayer(sketchCanvasRef.current, isSketchable);
     sketchRef.current = sketch;
     sketch.mount();

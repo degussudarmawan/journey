@@ -113,7 +113,16 @@ export class SpiralEngine {
     this.selectedKey = null;
     this.unlocking = false;
     this.doorArt = null;
+    // Set from Spiral.jsx once a WebGL context exists. When present, the door
+    // is real 3D geometry on its own canvas behind this one; when null (no
+    // WebGL) the 2D strip fallback in door.js draws it onto this canvas.
+    this.door3d = null;
     this.onUnlocked = null; // set by the host; fires when the door finishes opening
+    // Debug: ?unlock=0.72 in the URL jumps straight to the orbit with a key
+    // already selected and FREEZES the unlock at that fraction of the
+    // sequence. Lets one moment of the door be inspected without scrolling
+    // the whole track and clicking through every time. null = normal.
+    this._debugU = null;
   }
 
   // ---- Small math helpers -----------------------------------------------
@@ -699,9 +708,13 @@ export class SpiralEngine {
   U_INSERT = [0.52, 0.63]; // key seats into the hole
   U_TURN = [0.63, 0.79]; // key rotates — the actual unlocking
   U_SWING = [0.79, 1.0]; // door opens
-  KEY_DOOR_SCALE = 0.15; // key height at the door, as a fraction of min(w,h)
+  KEY_DOOR_SCALE = 0.32; // key height at the door, as a fraction of min(w,h)
   KEY_PIVOT_Y = 0.72; // point along the key (local units) that enters the hole
   KEY_TURN_ANGLE = Math.PI * 0.46; // how far the key rotates to unlock
+  // How far the key pitches over to point into the door as it enters. Short
+  // of a right angle deliberately: at exactly 90 degrees the key aims straight
+  // down the view axis and projects to a flat line, so it disappears.
+  KEY_INSERT_TILT = Math.PI * 0.22;
 
   // Partitions every halftone dot into its spike and records it in that
   // spike's local 3D frame. Dots belonging to spikes not listed in
@@ -1010,6 +1023,11 @@ export class SpiralEngine {
     group.forEach((ref, i) => {
       ref.sub.keyLocal = pts[i];
     });
+
+    // Build the door now rather than on the unlock click. Nothing is shown
+    // yet, but choosing a key is the strongest signal we get that the door is
+    // about to be needed, and this is the expensive step.
+    this.ensureDoorArt();
   }
 
   // Maps the key's own 2D space into a piece's 3D frame, so the key rides the
@@ -1032,9 +1050,24 @@ export class SpiralEngine {
     };
   }
 
+  /**
+   * The point along the key (its own units, y down) currently sitting in the
+   * keyhole. Starts at the key's TIP — so the flight ends with the key merely
+   * touching the lock — and travels up the shaft to KEY_PIVOT_Y as it seats.
+   *
+   * Insertion is this number moving, and nothing else. The key's position and
+   * the 3D clipping plane that swallows it are both derived from it, so how
+   * far in the key looks and how far in the key is can't drift apart.
+   */
+  keyPivotNow(u) {
+    const tip = this.selectedKey?.bounds?.y1 ?? 1.2;
+    return this.lerp(tip, this.KEY_PIVOT_Y, this.phase(u, this.U_INSERT));
+  }
+
   /** 0 while nothing is selected, ramping to 1 as the morph completes. */
   selectProgress(elapsed) {
     if (this.selectedSlot == null) return 0;
+    if (this._debugU !== null) return 1; // skip the morph; we want it formed
     return this.clamp((elapsed - this._selectT0) / this.KEY_MORPH_SECS, 0, 1);
   }
 
@@ -1049,6 +1082,7 @@ export class SpiralEngine {
 
   /** 0 until the unlock starts, then ramps to 1 as the door finishes opening. */
   unlockProgress(elapsed) {
+    if (this._debugU !== null) return this._debugU;
     if (!this.unlocking) return 0;
     return this.clamp((elapsed - this._unlockT0) / this.UNLOCK_SECS, 0, 1);
   }
@@ -1061,10 +1095,22 @@ export class SpiralEngine {
     this.selectedKey = null;
   }
 
-  // The door art is costly to paint and never changes, so it's built once for
-  // the current viewport and thrown away only on resize.
+  // The door art is costly to build (two full-size paint passes, plus the
+  // normal map derived from them) and never changes, so it's made once for the
+  // current viewport and thrown away only on resize. Called on *selection*
+  // rather than on the click that unlocks, so the cost lands seconds before
+  // the door is needed instead of as a hitch on the first frame of the fade.
   ensureDoorArt() {
     const { w, h } = this.dims;
+    if (this.door3d?.ok) {
+      this.door3d.ensure(
+        w,
+        h,
+        this.selectedKey?.doorText || "",
+        this.selectedKey,
+      );
+      return;
+    }
     if (this.doorArt && this.doorArt.W === w && this.doorArt.H === h) return;
     this.doorArt = buildDoorArt(w, h, this.selectedKey?.doorText || "");
   }
@@ -1104,16 +1150,12 @@ export class SpiralEngine {
     const y1 = [-st, ct, 0];
     const z1 = [0, 0, 1];
     const endScale = (Math.min(w, h) * this.KEY_DOOR_SCALE) / 2.4;
-    // Place the key so its pivot point lands in the keyhole (world origin is
-    // screen centre, which is where the keyhole is), then push it inward as it
-    // seats. Because the pivot offset is expressed along the *rotated* y axis,
-    // the key swings around the keyhole rather than about its own middle.
-    const seat = this.phase(u, this.U_INSERT) * endScale * 0.5;
-    const o1 = [
-      -endScale * this.KEY_PIVOT_Y * y1[0],
-      -endScale * this.KEY_PIVOT_Y * y1[1],
-      seat,
-    ];
+    // Place the key so the point currently entering the lock lands in the
+    // keyhole (world origin is screen centre, which is where the keyhole is).
+    // Because that offset is expressed along the *rotated* y axis, the key
+    // swings around the keyhole rather than about its own middle.
+    const pivot = this.keyPivotNow(u);
+    const o1 = [-endScale * pivot * y1[0], -endScale * pivot * y1[1], 0];
 
     const t = this.phase(u, this.U_FLIGHT);
     const mix3 = (a, b) => {
@@ -1266,6 +1308,8 @@ export class SpiralEngine {
     window.addEventListener("pointerdown", this.onPointerDown);
     window.addEventListener("pointerleave", this.onPointerLeave);
     window.addEventListener("blur", this.onPointerLeave);
+    const dbg = new URLSearchParams(window.location.search).get("unlock");
+    if (dbg !== null) this._debugU = this.clamp(parseFloat(dbg) || 0, 0, 1);
     this.onScroll();
     this.raf = requestAnimationFrame(this.loop);
   }
@@ -1280,10 +1324,11 @@ export class SpiralEngine {
       this.buildGrid();
       this.rebuildWords();
       this.buildStar();
-      // Door art is painted to the old viewport size; drop it and let the
-      // unlock rebuild it on demand.
+      // Door art is built for the old viewport size; drop it and let the
+      // unlock rebuild it on demand. (Door3D.ensure() compares against the
+      // size it last built for, so it invalidates itself.)
       this.doorArt = null;
-      if (this.unlocking) this.ensureDoorArt();
+      if (this.unlocking || this.selectedSlot != null) this.ensureDoorArt();
     }, 200);
   }
 
@@ -1338,6 +1383,13 @@ export class SpiralEngine {
   // Converts the track element's scroll position into this.scrollT (0..1),
   // and fades the "Scroll" hint out over the first ~7% of scroll.
   onScroll() {
+    if (this._debugU !== null) {
+      // Park in the middle of orbitHold, wherever the page actually is.
+      const st = this.stageDefs?.find((x) => x.kind === "orbitHold");
+      this.scrollT = st ? (st.t0 + st.t1) / 2 : 1;
+      if (this.hint) this.hint.style.opacity = "0";
+      return;
+    }
     if (!this.track) return;
     const rect = this.track.getBoundingClientRect();
     const total = rect.height - this.dims.h;
@@ -1389,6 +1441,15 @@ export class SpiralEngine {
     if (starPresence >= 0.999) ctx.fillStyle = this.INK; // fully settled: skip per-dot colour lookups
 
     if (inOrbit && this.orbitGroups) {
+      // Debug mode picks the first spike that actually has a key, so the
+      // frozen frame has something to show.
+      if (this._debugU !== null && this.selectedSlot == null && this.orbitSlots) {
+        const k = this.orbitSlots.findIndex((sl) => keyForSpike(sl.spikeIdx));
+        if (k >= 0) {
+          this.selectPiece(k, elapsed);
+          this.unlocking = true;
+        }
+      }
       this.starFrame(elapsed); // the un-detached remainder is still a star
       this.orbitFrame(elapsed, stage.kind === "toOrbit" ? stage.mix : 1);
       ctx.fillStyle = this.INK;
@@ -1417,13 +1478,48 @@ export class SpiralEngine {
       // Unlock sequence. The door goes down first so everything else layers
       // over it, and the pieces still on the ring sweep away as it rises.
       const u = this.unlockProgress(elapsed);
-      if (u > 0 && this.doorArt) {
+      // How far the 3D key has taken over from the 2D one (0 until the very
+      // end of the flight). Read again further down to fade the 2D key out.
+      this._keyHandoff = 0;
+      if (u > 0) {
         const doorIn = this.phase(u, this.U_DOOR_IN);
         const swing = this.phase(u, this.U_SWING);
-        ctx.save();
-        ctx.globalAlpha = doorIn;
-        drawDoor(ctx, this.doorArt, w, h, swing, 1 - this.phase(u, this.U_SWING));
-        ctx.restore();
+        if (this.door3d?.ok) {
+          // The 3D door lives on its own canvas *behind* this one, so it
+          // isn't drawn here — it just gets told what to look like, and
+          // renders itself at the end of the frame.
+          this.door3d.setState({
+            alpha: doorIn,
+            open: swing,
+            plateAlpha: 1 - swing,
+          });
+
+          // Hand the key over to the 3D scene as its flight lands. The two
+          // representations coincide exactly at that instant — the key is at
+          // the world origin, where both projections are identity — so this
+          // short crossfade covers a swap that has almost nothing to hide.
+          // From here on the key is a mesh in the door's own scene, which is
+          // the only way it can be occluded BY the door as it goes in.
+          this._keyHandoff = this.smoothstep(
+            this.U_FLIGHT[1] - 0.05,
+            this.U_FLIGHT[1],
+            u,
+          );
+          this.door3d.setKey({
+            show: this._keyHandoff > 0,
+            scale: (Math.min(w, h) * this.KEY_DOOR_SCALE) / 2.4,
+            pivotY: this.keyPivotNow(u),
+            insert: this.phase(u, this.U_INSERT),
+            tilt: this.phase(u, this.U_INSERT) * this.KEY_INSERT_TILT,
+            turn: this.phase(u, this.U_TURN) * this.KEY_TURN_ANGLE,
+            alpha: this._keyHandoff * (1 - swing),
+          });
+        } else if (this.doorArt) {
+          ctx.save();
+          ctx.globalAlpha = doorIn;
+          drawDoor(ctx, this.doorArt, w, h, swing, 1 - swing);
+          ctx.restore();
+        }
       }
       const clearOut = this.phase(u, this.U_CLEAR);
 
@@ -1500,7 +1596,8 @@ export class SpiralEngine {
         // place in the ring's far-to-near ordering like any other piece.
         // The key rides in the lock, so it goes with the door: fade it out as
         // the leaves swing rather than leaving it hanging in the gap.
-        const keyAlpha = keyFade * (1 - this.phase(u, this.U_SWING));
+        const keyAlpha =
+          keyFade * (1 - this.phase(u, this.U_SWING)) * (1 - this._keyHandoff);
         if (chosen && keyAlpha > 0.004) {
           const mid = keyProject(0, 0, 0); // key centre, for depth-scaled linework
           const lineScale = this.lerp(
@@ -1544,6 +1641,7 @@ export class SpiralEngine {
       }
 
       ctx.globalAlpha = 1;
+      this.renderDoor3D(this.unlocking);
       this.raf = requestAnimationFrame(this.loop);
       return;
     }
@@ -1648,7 +1746,26 @@ export class SpiralEngine {
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.fill();
     }
+
+    this.renderDoor3D(false);
     this.raf = requestAnimationFrame(this.loop);
+  }
+
+  /**
+   * Renders the 3D door layer, from whatever state this frame set on it.
+   * Called from every exit of loop() — the orbit branch returns early, so a
+   * single call at the bottom would miss precisely the stage the door is
+   * shown in.
+   *
+   * @param {boolean} live whether an unlock is actually running right now.
+   *   Anything else — scrolling back out of the orbit, dismissing the key
+   *   page — hides the layer: unlike the 2D canvas it isn't cleared each
+   *   frame, so a stale door would simply stay on screen.
+   */
+  renderDoor3D(live) {
+    if (!this.door3d?.ok) return;
+    if (!live) this.door3d.setState({ alpha: 0 });
+    this.door3d.render();
   }
 
   /** Stops the loop and tears down listeners. Call from a mount effect's cleanup. */

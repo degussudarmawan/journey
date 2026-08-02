@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { SpiralEngine, DEFAULT_PALETTE } from "./spiralEngine";
 import { SketchLayer } from "./sketchLayer";
+import { Door3D } from "./door3d";
 import KeyPage from "./KeyPage";
 
 /**
@@ -28,6 +29,7 @@ export default function Spiral({
   cursorRepel = 1,
 }) {
   const canvasRef = useRef(null);
+  const doorLayerRef = useRef(null);
   const sketchCanvasRef = useRef(null);
   const trackRef = useRef(null);
   const hintRef = useRef(null);
@@ -83,6 +85,13 @@ export default function Spiral({
     engineRef.current = engine;
     // Fires when the door has finished swinging open.
     engine.onUnlocked = (keyId) => setUnlockedKey(keyId ?? "unknown");
+
+    // The door is real 3D geometry on its own WebGL canvas behind the dots.
+    // If a context can't be created, engine.door3d stays null and the 2D
+    // strip-based door in door.js draws instead — same sequence, flatter.
+    const door3d = new Door3D(doorLayerRef.current);
+    if (door3d.mount()) engine.door3d = door3d;
+
     engine.mount();
 
     // Sketching is parked for now — it's headed for one of the key pages
@@ -104,6 +113,7 @@ export default function Spiral({
     return () => {
       engine.unmount();
       engineRef.current = null;
+      door3d.unmount();
       sketch.unmount();
       sketchRef.current = null;
       window.removeEventListener("scroll", onScroll);
@@ -139,6 +149,15 @@ export default function Spiral({
             overflow: "hidden",
           }}
         >
+          {/* Door layer: the backmost element, so the dots, the key and the
+              doodles all draw over the top of it. Empty here on purpose —
+              Door3D creates its own WebGL canvas inside this box and fades
+              the whole layer in via CSS opacity, which is one compositor
+              property instead of a transparency pass over every material. */}
+          <div
+            ref={doorLayerRef}
+            style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
+          />
           {/* Doodle layer: sits underneath the particle canvas, so marks
               show through the gaps between dots, like the star is drawn on
               top of a page the user has been scribbling on. Only accepts

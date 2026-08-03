@@ -104,8 +104,23 @@ export function strokeContour(path, width, taper = [1, 1]) {
  * on the origin and `targetHeight` tall. Lets a key be authored in whatever
  * pixel coordinates were convenient (traced off a reference image, say) and
  * still drop into the scene at a predictable size and centring.
+ *
+ * @param {object} [lock] Where this key meets its lock, in the SAME authoring
+ *   coordinates as the parts. Optional, but without it the door has to guess,
+ *   and guessing is how you end up with a keyhole narrower than the key.
+ *   - `x`          the shaft's axis. Rarely the key's centre: ornament hangs
+ *                  off one side, so the bounding box's middle is not where the
+ *                  stem actually is, and using it puts the key in crooked.
+ *   - `yEnter`     the depth at which the key stops going in — normally the
+ *                  top of the bit, so the bit is inside and the shaft is in
+ *                  the bore.
+ *   - `bitBottom`  the lowest point that has to fit through the hole.
+ *   - `shaftHalf`  half the stem's width, at `yEnter`. Sizes the bore.
+ *   - `bitHalf`    half the widest span below `yEnter`, measured from `x`.
+ *                  Sizes the slot. Note this is measured from the SHAFT AXIS,
+ *                  not the key's centre, and covers both sides.
  */
-export function normalizeParts(parts, targetHeight = 2.4) {
+export function normalizeParts(parts, targetHeight = 2.4, lock = null) {
   let x0 = Infinity,
     y0 = Infinity,
     x1 = -Infinity,
@@ -142,5 +157,16 @@ export function normalizeParts(parts, targetHeight = 2.4) {
       x1: (x1 - cx) * s,
       y1: (y1 - cy) * s,
     },
+    // The lock spec rides along through the same transform, so it can be
+    // written in the reference image's pixel coordinates like everything else.
+    lock: lock
+      ? {
+          pivotX: (lock.x - cx) * s, // the shaft's axis, NOT the key's centre
+          pivotY: (lock.yEnter - cy) * s,
+          bitBottom: (lock.bitBottom - cy) * s,
+          shaftHalf: lock.shaftHalf * s,
+          bitHalf: lock.bitHalf * s,
+        }
+      : null,
   };
 }

@@ -710,7 +710,12 @@ export class SpiralEngine {
   U_SWING = [0.79, 1.0]; // door opens
   KEY_DOOR_SCALE = 0.32; // key height at the door, as a fraction of min(w,h)
   KEY_PIVOT_Y = 0.72; // point along the key (local units) that enters the hole
-  KEY_TURN_ANGLE = Math.PI * 0.46; // how far the key rotates to unlock
+  // How far the key rotates to unlock. The turn is about the SHAFT, so the
+  // key's flat face swings toward edge-on and it narrows as it goes — near a
+  // right angle it's a sliver and reads as having vanished rather than turned.
+  // Stopping around 54 degrees keeps ~60% of its width and still reads as a
+  // decisive turn.
+  KEY_TURN_ANGLE = Math.PI * 0.3;
   // How far the key pitches over to point into the door as it enters. Short
   // of a right angle deliberately: at exactly 90 degrees the key aims straight
   // down the view axis and projects to a flat line, so it disappears.
@@ -1061,7 +1066,18 @@ export class SpiralEngine {
    */
   keyPivotNow(u) {
     const tip = this.selectedKey?.bounds?.y1 ?? 1.2;
-    return this.lerp(tip, this.KEY_PIVOT_Y, this.phase(u, this.U_INSERT));
+    // Where the key stops going in. Declared per key (see geom.js's `lock`),
+    // because it depends on where that key's bit begins — a fixed fraction
+    // put the widest part of the lilac key's teeth inside a slot sized for
+    // its much narrower stem.
+    const seated = this.selectedKey?.lock?.pivotY ?? this.KEY_PIVOT_Y;
+    return this.lerp(tip, seated, this.phase(u, this.U_INSERT));
+  }
+
+  /** World units per key unit once the key is at the door. */
+  keyDoorScale() {
+    const { w, h } = this.dims;
+    return (Math.min(w, h) * this.KEY_DOOR_SCALE) / 2.4;
   }
 
   /** 0 while nothing is selected, ramping to 1 as the morph completes. */
@@ -1108,6 +1124,7 @@ export class SpiralEngine {
         h,
         this.selectedKey?.doorText || "",
         this.selectedKey,
+        this.keyDoorScale(),
       );
       return;
     }
@@ -1154,8 +1171,16 @@ export class SpiralEngine {
     // keyhole (world origin is screen centre, which is where the keyhole is).
     // Because that offset is expressed along the *rotated* y axis, the key
     // swings around the keyhole rather than about its own middle.
+    // Offset along BOTH rotated axes: the shaft's axis is off the key's centre
+    // (ornament hangs to one side), so ignoring x would aim the bounding box
+    // at the keyhole rather than the stem.
     const pivot = this.keyPivotNow(u);
-    const o1 = [-endScale * pivot * y1[0], -endScale * pivot * y1[1], 0];
+    const pivotX = this.selectedKey?.lock?.pivotX ?? 0;
+    const o1 = [
+      -endScale * (pivot * y1[0] + pivotX * x1[0]),
+      -endScale * (pivot * y1[1] + pivotX * x1[1]),
+      0,
+    ];
 
     const t = this.phase(u, this.U_FLIGHT);
     const mix3 = (a, b) => {
@@ -1507,7 +1532,8 @@ export class SpiralEngine {
           );
           this.door3d.setKey({
             show: this._keyHandoff > 0,
-            scale: (Math.min(w, h) * this.KEY_DOOR_SCALE) / 2.4,
+            scale: this.keyDoorScale(),
+            pivotX: this.selectedKey?.lock?.pivotX ?? 0,
             pivotY: this.keyPivotNow(u),
             insert: this.phase(u, this.U_INSERT),
             tilt: this.phase(u, this.U_INSERT) * this.KEY_INSERT_TILT,

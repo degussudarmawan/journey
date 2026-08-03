@@ -118,7 +118,8 @@ const toothLower = { contour: roundRectContour(196, 790, 292, 828, 14) };
 const bitSpine = { contour: roundRectContour(272, 688, 316, 828, 16) };
 const terminal = { contour: ellipseContour(176, 852, 46, 44) };
 
-const { parts, bounds } = normalizeParts([
+const { parts, bounds, lock } = normalizeParts(
+  [
   // Ordered back-to-front-ish for authoring clarity only; the renderer sorts
   // by actual projected depth every frame.
   { contour: topCurl },
@@ -132,15 +133,31 @@ const { parts, bounds } = normalizeParts([
   shaft,
   toothUpper,
   bitSpine,
-  toothLower,
-  terminal,
-]);
+    toothLower,
+    terminal,
+  ],
+  2.4,
+  // Where this key meets its lock. The door sizes the keyhole from these, so
+  // the hole always admits the key that opens it.
+  {
+    x: 176, // the shaft's axis: roundRect(152..200). NOT the key's centre —
+    //         the bow and scrolls sit right of the stem, which drags the
+    //         bounding box's middle about 40px off the stem itself.
+    yEnter: 688, // top of the teeth. Above this is stem, below is bit.
+    bitBottom: 896, // the terminal's lowest point
+    shaftHalf: 24, // (200 - 152) / 2
+    // Widest span below yEnter, measured from x=176: the spine reaches 316
+    // (+140) and the terminal reaches 130 (-46), so 140 covers both.
+    bitHalf: 140,
+  },
+);
 
 export const lilacKey = {
   id: "lilac",
   name: "Lilac",
   parts,
   bounds,
+  lock,
   // Extrusion depth, in the same normalised units as the geometry (total
   // height is 2.4), so the key is a slim slab rather than a chunky block.
   depth: 0.085,

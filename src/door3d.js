@@ -147,14 +147,14 @@ function heightToSpec(src) {
  * The hole is the whole point — without it the plate is a solid slab and the
  * key has nowhere to go, so it ends up perched on the front looking pasted on.
  */
-function escutcheonShape(pw, ph) {
+function escutcheonShape(pw, ph, hole) {
   const s = new THREE.Shape();
   const top = ph * 0.39;
   const bot = -ph * 0.55;
   s.moveTo(0, top);
   s.bezierCurveTo(pw * 0.45, ph * 0.3, pw * 0.38, -ph * 0.22, 0, bot);
   s.bezierCurveTo(-pw * 0.38, -ph * 0.22, -pw * 0.45, ph * 0.3, 0, top);
-  s.holes.push(keyholeShape(pw, ph));
+  s.holes.push(keyholeShape(hole));
   return s;
 }
 
@@ -165,11 +165,8 @@ function escutcheonShape(pw, ph) {
  * sized for looks alone ends up narrower than the key that has to pass
  * through it, and then the key visibly doesn't fit its own lock.
  */
-function keyholeShape(pw, ph) {
-  const r = pw * 0.2;
-  const halfTop = pw * 0.11; // where the slot meets the bore
-  const halfBot = pw * 0.13; // it flares as it descends
-  const yBot = -ph * 0.34;
+function keyholeShape(hole) {
+  const { r, halfTop, halfBot, yBot } = hole;
   // Meet the circle exactly where the slot's sides cross it, so the two
   // merge into one silhouette instead of reading as a disc with a tab.
   const yJoin = -Math.sqrt(Math.max(0, r * r - halfTop * halfTop));
@@ -331,7 +328,7 @@ export class Door3D {
   }
 
   /** Rebuilds if the viewport or the door's inscription has changed. */
-  ensure(W, H, strapText = "", keyDef = null) {
+  ensure(W, H, strapText = "", keyDef = null, keyScale = 1) {
     if (!this.ok) return;
     if (
       this.built &&
@@ -342,11 +339,11 @@ export class Door3D {
     ) {
       return;
     }
-    this._build(W, H, strapText, keyDef);
+    this._build(W, H, strapText, keyDef, keyScale);
     this.built = { W, H, text: strapText, keyId: keyDef?.id ?? null };
   }
 
-  _build(W, H, strapText, keyDef) {
+  _build(W, H, strapText, keyDef, keyScale) {
     this._teardownScene();
     this.renderer.setSize(W, H, false); // false: React owns the CSS size
     this.camera.aspect = W / H;
@@ -453,8 +450,37 @@ export class Door3D {
     // Real geometry, not a picture of a lock: the plate is an extruded shield
     // with the keyhole as an actual void through it, and a socket recedes
     // behind that void so the hole has an inside.
-    const pw = Math.round(Math.min(W, H) * 0.13);
-    const ph = pw * 1.45;
+    // THE HOLE IS SIZED TO WHAT SHOWS; THE PLATE IS SIZED TO WHAT MUST HIDE.
+    //
+    // These are two different measurements and conflating them wrecks the
+    // look. The obvious move is to make the slot admit the whole bit — that's
+    // what a real warded keyhole does — but this key's bit is nearly six times
+    // its stem's width, so an honest slot is a giant funnel with a keyhole at
+    // the top of it. It's correct and it looks awful.
+    //
+    // The bit doesn't have to fit through the hole. It has to *disappear*, and
+    // the plate is opaque, so the depth buffer already hides anything sitting
+    // behind it. So: the bore is sized to the stem, which is the only part
+    // anyone actually sees enter, and the plate is made broad enough to
+    // swallow the bit. Classic keyhole silhouette, nothing poking out.
+    const lk = keyDef?.lock;
+    const hole = lk
+      ? {
+          r: lk.shaftHalf * 1.75 * keyScale, // bore: the stem, with clearance
+          halfTop: lk.shaftHalf * 1.25 * keyScale,
+          halfBot: lk.shaftHalf * 2.1 * keyScale, // a modest ward flare
+          yBot: -lk.shaftHalf * 7 * keyScale,
+        }
+      : { r: 14, halfTop: 8, halfBot: 14, yBot: -46 }; // keyless spikes
+    // Wide enough that the bit stays behind it. escutcheonShape's outline
+    // reaches about 0.34 * pw at its widest, hence the 3.2.
+    const bitHalf = (lk?.bitHalf ?? 0) * keyScale;
+    const pw = Math.max(Math.round(Math.min(W, H) * 0.075), Math.round(bitHalf * 3.2));
+    // Long enough that the bit's tip stays behind it too — the outline's
+    // bottom sits at -0.55 * ph, so it has to clear the deepest point of the
+    // key with margin, or the tip juts out below the plate.
+    const bitDrop = (lk ? lk.bitBottom - lk.pivotY : 0) * keyScale;
+    const ph = Math.max(pw * 1.45, bitDrop * 2.1, -hole.yBot * 2.5);
     const pd = pw * 0.13; // how far the plate stands off the door
     const sd = pw * 0.75; // how deep the keyhole bores in
     this.plate = new THREE.Group();
@@ -476,7 +502,7 @@ export class Door3D {
     );
     const plate = new THREE.Mesh(
       track(
-        new THREE.ExtrudeGeometry(escutcheonShape(pw, ph), {
+        new THREE.ExtrudeGeometry(escutcheonShape(pw, ph, hole), {
           depth: pd,
           bevelEnabled: true,
           bevelThickness: pd * 0.45,
@@ -513,7 +539,7 @@ export class Door3D {
     );
     const socket = new THREE.Mesh(
       track(
-        new THREE.ExtrudeGeometry(keyholeShape(pw, ph), {
+        new THREE.ExtrudeGeometry(keyholeShape(hole), {
           depth: sd,
           bevelEnabled: false,
           curveSegments: 24,
@@ -588,7 +614,10 @@ export class Door3D {
     // How far along the shaft the lock has swallowed. Sliding the key along
     // its own axis is what "inserting" means; the tilt below is what aims
     // that axis into the door.
-    this._key.object.position.set(0, s.pivotY, 0);
+    // Offset by the SHAFT AXIS, not the key's centre. The bow and scrolls hang
+    // to one side, so centring the bounding box would stand the key in the
+    // lock visibly crooked.
+    this._key.object.position.set(-s.pivotX, s.pivotY, 0);
     this.keyPivot.scale.setScalar(s.scale);
     this.keyPivot.position.set(
       0,

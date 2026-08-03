@@ -107,6 +107,8 @@ export class SpiralEngine {
     this.onPointerMove = this.onPointerMove.bind(this);
     this.onPointerLeave = this.onPointerLeave.bind(this);
     this.onPointerDown = this.onPointerDown.bind(this);
+    this.onPointerUp = this.onPointerUp.bind(this);
+    this.onDoubleClick = this.onDoubleClick.bind(this);
     this.loop = this.loop.bind(this);
 
     this.selectedSlot = null; // index into orbitSlots, once a key is chosen
@@ -123,6 +125,20 @@ export class SpiralEngine {
     // sequence. Lets one moment of the door be inspected without scrolling
     // the whole track and clicking through every time. null = normal.
     this._debugU = null;
+    // Free look inside the orbit. Identity by default, so the default framing
+    // is exactly what it was before this existed. `t*` are the drag targets;
+    // the un-prefixed values chase them (see updateView).
+    this.view = {
+      yaw: 0,
+      pitch: 0,
+      panX: 0,
+      panY: 0,
+      tYaw: 0,
+      tPitch: 0,
+      tPanX: 0,
+      tPanY: 0,
+    };
+    this._drag = null;
   }
 
   // ---- Small math helpers -----------------------------------------------
@@ -720,6 +736,13 @@ export class SpiralEngine {
   // of a right angle deliberately: at exactly 90 degrees the key aims straight
   // down the view axis and projects to a flat line, so it disappears.
   KEY_INSERT_TILT = Math.PI * 0.22;
+  // ---- Free look ----
+  VIEW_DRAG_SPEED = 0.006; // radians of rotation per pixel dragged
+  VIEW_PAN_SPEED = 1; // screen px of pan per pixel dragged
+  VIEW_PITCH_LIMIT = (74 * Math.PI) / 180; // short of straight down: past this
+  //   the ring is edge-on and there is nothing left to look at
+  VIEW_EASE = 0.14; // per-frame approach to the drag target
+  VIEW_DRAG_SLOP = 5; // px of movement before a press stops being a click
 
   // Partitions every halftone dot into its spike and records it in that
   // spike's local 3D frame. Dots belonging to spikes not listed in
@@ -810,6 +833,84 @@ export class SpiralEngine {
   orbitPersp(z) {
     const f = this.ORBIT_FOCAL;
     return f / Math.max(f * 0.25, f + z);
+  }
+
+  /* ---- Free look --------------------------------------------------------
+     The orbit stage is a real 3D space you can walk around in, and this is
+     the one door between that space and the screen. Every orbit stage draws
+     through project(): the needles, the star core they left behind, and the
+     key. Putting the camera here rather than in each of them is what keeps
+     them in the same space — miss one and it stays welded to the screen
+     while everything else swings past it.
+
+     Identity until the user drags, so the default composition is untouched.
+     ---------------------------------------------------------------------- */
+
+  /** Rotates a world point into view space, then projects it to the screen. */
+  project(x, y, z) {
+    const v = this.view;
+    const cy = Math.cos(v.yaw),
+      sy = Math.sin(v.yaw);
+    const cp = Math.cos(v.pitch),
+      sp = Math.sin(v.pitch);
+    const ax = x * cy + z * sy; // yaw about the vertical
+    const az = z * cy - x * sy;
+    const ay = y * cp - az * sp; // then pitch about the horizontal
+    const bz = az * cp + y * sp;
+    const persp = this.orbitPersp(bz);
+    return {
+      // Pan is applied in SCREEN space, after the divide. Panning in world
+      // space would slide the scene through the perspective and warp it;
+      // this just moves the window you're looking through.
+      x: this.orbitCx + v.panX + ax * persp,
+      y: this.orbitCy + v.panY + ay * persp,
+      scale: persp,
+      z: bz,
+    };
+  }
+
+  /** Just the view-space depth — for painter ordering, which can't use world z. */
+  viewDepth(x, y, z) {
+    const v = this.view;
+    const az = z * Math.cos(v.yaw) - x * Math.sin(v.yaw);
+    return az * Math.cos(v.pitch) + y * Math.sin(v.pitch);
+  }
+
+  /** A star-formation screen point, lifted into the orbit's space at z = 0. */
+  projectStarPoint(sp) {
+    return this.project(sp.x - this.orbitCx, sp.y - this.orbitCy, 0);
+  }
+
+  /**
+   * Eases the live view toward wherever the drag left it. Called once a frame.
+   * Smoothing rather than snapping because the pieces are already in motion —
+   * a camera that stops dead the instant you release reads as a glitch.
+   */
+  updateView() {
+    const v = this.view;
+    const k = this.VIEW_EASE;
+    v.yaw += (v.tYaw - v.yaw) * k;
+    v.pitch += (v.tPitch - v.pitch) * k;
+    v.panX += (v.tPanX - v.panX) * k;
+    v.panY += (v.tPanY - v.panY) * k;
+  }
+
+  /** Returns the view to its default framing. */
+  resetView(immediate = false) {
+    const v = this.view;
+    v.tYaw = v.tPitch = v.tPanX = v.tPanY = 0;
+    if (immediate) {
+      v.yaw = v.pitch = v.panX = v.panY = 0;
+    }
+  }
+
+  /** True when the pointer should be steering the camera rather than picking. */
+  canFreeLook() {
+    return (
+      !this.unlocking &&
+      this.stageDefs &&
+      ["toOrbit", "orbitHold"].includes(this.getStage(this.scrollT).kind)
+    );
   }
 
   // Per-frame, per-piece state: computed once per piece here rather than per
@@ -931,7 +1032,11 @@ export class SpiralEngine {
       pose.uy = hy;
       pose.uz = hz;
       pose.slot = slot;
-      pose.z = tz * e; // for coarse piece-level depth ordering
+      // Coarse piece-level depth ordering, in VIEW space rather than world
+      // space. Sorting on world z would be right only from the default
+      // camera; swing round behind the ring and the painter order inverts,
+      // so near pieces get painted over by far ones.
+      pose.z = this.viewDepth(pose.px, pose.py, pose.pz);
     }
 
     this._orbitOrder = frames
@@ -947,16 +1052,11 @@ export class SpiralEngine {
     const la = sub.rayAlong - f.slot.anchorAlong;
     const lc = sub.rayAcross;
     const lu = sub.rayUp * f.e;
-    const x = f.px + la * f.ax + lc * f.cx + lu * f.ux;
-    const y = f.py + la * f.ay + lc * f.cy + lu * f.uy;
-    const z = f.pz + la * f.az + lc * f.cz + lu * f.uz;
-    const persp = this.orbitPersp(z);
-    return {
-      x: this.orbitCx + x * persp,
-      y: this.orbitCy + y * persp,
-      scale: persp,
-      z,
-    };
+    return this.project(
+      f.px + la * f.ax + lc * f.cx + lu * f.ux,
+      f.py + la * f.ay + lc * f.cy + lu * f.uy,
+      f.pz + la * f.az + lc * f.cz + lu * f.uz,
+    );
   }
 
   // ---- Key selection ----------------------------------------------------------
@@ -1090,6 +1190,12 @@ export class SpiralEngine {
   /** Begins the unlock. Only valid on a key that has finished forming. */
   startUnlock(elapsed) {
     if (this.unlocking) return;
+    // Bring the camera home. The door is a fixed backdrop that does NOT swing
+    // with the free look, and the key's flight ends at the world origin —
+    // which is only the keyhole's position from the default view. Left
+    // rotated, the key would fly to somewhere off the lock entirely. The ease
+    // has the whole clear-out and door fade-in to settle.
+    this.resetView();
     this.unlocking = true;
     this._unlockT0 = elapsed;
     this._unlockFired = false;
@@ -1209,13 +1315,7 @@ export class SpiralEngine {
       const wx = O[0] + ax * X[0] + ay * Y[0] + az * Z[0];
       const wy = O[1] + ax * X[1] + ay * Y[1] + az * Z[1];
       const wz = O[2] + ax * X[2] + ay * Y[2] + az * Z[2];
-      const persp = this.orbitPersp(wz);
-      return {
-        x: this.orbitCx + wx * persp,
-        y: this.orbitCy + wy * persp,
-        scale: persp,
-        z: wz,
-      };
+      return this.project(wx, wy, wz);
     };
   }
 
@@ -1331,10 +1431,21 @@ export class SpiralEngine {
       passive: true,
     });
     window.addEventListener("pointerdown", this.onPointerDown);
+    window.addEventListener("pointerup", this.onPointerUp);
+    window.addEventListener("dblclick", this.onDoubleClick);
     window.addEventListener("pointerleave", this.onPointerLeave);
     window.addEventListener("blur", this.onPointerLeave);
-    const dbg = new URLSearchParams(window.location.search).get("unlock");
+    const params = new URLSearchParams(window.location.search);
+    const dbg = params.get("unlock");
     if (dbg !== null) this._debugU = this.clamp(parseFloat(dbg) || 0, 0, 1);
+    // Debug: ?yaw=0.7&pitch=0.4 starts the free look already swung round, so a
+    // given viewpoint can be reproduced (or screenshotted) without dragging.
+    const yaw = params.get("yaw");
+    const pitch = params.get("pitch");
+    if (yaw !== null) this.view.yaw = this.view.tYaw = parseFloat(yaw) || 0;
+    if (pitch !== null) {
+      this.view.pitch = this.view.tPitch = parseFloat(pitch) || 0;
+    }
     this.onScroll();
     this.raf = requestAnimationFrame(this.loop);
   }
@@ -1365,6 +1476,34 @@ export class SpiralEngine {
     this.pointer.y = e.clientY - rect.top;
     this.pointer.active = true;
 
+    // Steering the camera. Once past the slop threshold this press is a drag,
+    // not a click — the flag survives until pointerup so releasing after a
+    // swing doesn't also select whatever happens to be under the cursor.
+    if (this._drag) {
+      const dx = e.clientX - this._drag.lastX;
+      const dy = e.clientY - this._drag.lastY;
+      this._drag.lastX = e.clientX;
+      this._drag.lastY = e.clientY;
+      this._drag.travel += Math.abs(dx) + Math.abs(dy);
+      if (this._drag.travel > this.VIEW_DRAG_SLOP) {
+        this._drag.moved = true;
+        const v = this.view;
+        if (this._drag.pan) {
+          v.tPanX += dx * this.VIEW_PAN_SPEED;
+          v.tPanY += dy * this.VIEW_PAN_SPEED;
+        } else {
+          v.tYaw += dx * this.VIEW_DRAG_SPEED;
+          v.tPitch = this.clamp(
+            v.tPitch - dy * this.VIEW_DRAG_SPEED,
+            -this.VIEW_PITCH_LIMIT,
+            this.VIEW_PITCH_LIMIT,
+          );
+        }
+        this.canvas.style.cursor = "grabbing";
+      }
+      return; // no hover testing mid-drag; the scene is moving under the cursor
+    }
+
     // Track which keyed spike is under the cursor, so hovering one can show
     // it's clickable. Without this the whole interaction is invisible: most
     // spikes have no key yet and clicking them does nothing at all.
@@ -1375,16 +1514,47 @@ export class SpiralEngine {
     this.hoverSlot = live
       ? this.hitTestPieces(this.pointer.x, this.pointer.y, true)
       : -1;
-    this.canvas.style.cursor = this.hoverSlot >= 0 ? "pointer" : "";
+    this.canvas.style.cursor =
+      this.hoverSlot >= 0 ? "pointer" : this.canFreeLook() ? "grab" : "";
   }
 
   onPointerLeave() {
     if (this.pointer) this.pointer.active = false;
   }
 
+  // A press in the orbit is ambiguous: it might be picking a spike, or it
+  // might be the start of a camera swing. Resolve it by waiting — arm a drag
+  // here, and let onPointerUp decide, since only movement tells them apart.
+  onPointerDown(e) {
+    if (this.canFreeLook()) {
+      this._drag = {
+        lastX: e.clientX,
+        lastY: e.clientY,
+        travel: 0,
+        moved: false,
+        // Shift, or any non-primary button, pans instead of rotating.
+        pan: e.shiftKey || e.button !== 0,
+      };
+    }
+  }
+
+  onPointerUp(e) {
+    const drag = this._drag;
+    this._drag = null;
+    if (this.canvas) this.canvas.style.cursor = "";
+    // A drag was a camera move, not a pick. Bail before selecting anything.
+    if (drag && drag.moved) return;
+    this.pickPiece(e);
+  }
+
+  /** Double-click anywhere empty puts the camera back where it started. */
+  onDoubleClick() {
+    if (this.canFreeLook()) this.resetView();
+  }
+
   // Picking a spike to turn into a key. Only live once the pieces have
   // finished detaching — clicking mid-flight would be a coin toss.
-  onPointerDown(e) {
+  pickPiece(e) {
     if (!this.canvas || !this.stageDefs || this.unlocking) return;
     if (this.getStage(this.scrollT).kind !== "orbitHold") return;
     const rect = this.canvas.getBoundingClientRect();
@@ -1464,6 +1634,13 @@ export class SpiralEngine {
     const inStar = stage.kind === "toStar" || stage.kind === "starHold";
     if (inStar) this.starFrame(elapsed);
     if (starPresence >= 0.999) ctx.fillStyle = this.INK; // fully settled: skip per-dot colour lookups
+
+    // Ease the camera before anything reads it, so every projection this
+    // frame agrees on where the viewer is standing. Scrolling back out of the
+    // orbit returns it to the default framing — the star and word stages are
+    // composed flat and have no free look of their own to inherit it.
+    if (!inOrbit) this.resetView();
+    this.updateView();
 
     if (inOrbit && this.orbitGroups) {
       // Debug mode picks the first spike that actually has a key, so the
@@ -1643,8 +1820,11 @@ export class SpiralEngine {
       const drawResidue = () => {
         ctx.globalAlpha = 1;
         for (const { sub } of this.orbitResidue) {
-          const sp = this.starPointFor(sub, elapsed);
-          dot(sp.x, sp.y, sub.dotR);
+          // The star lies flat at z = 0 in the orbit's space, so it swings
+          // with the camera like everything else. Left in raw screen space it
+          // would hang rigidly in front while the ring turned behind it.
+          const sp = this.projectStarPoint(this.starPointFor(sub, elapsed));
+          dot(sp.x, sp.y, sub.dotR * sp.scale);
         }
       };
 
@@ -1803,6 +1983,8 @@ export class SpiralEngine {
     window.removeEventListener("pointermove", this.onPointerMove);
     window.removeEventListener("pointerdown", this.onPointerMove);
     window.removeEventListener("pointerdown", this.onPointerDown);
+    window.removeEventListener("pointerup", this.onPointerUp);
+    window.removeEventListener("dblclick", this.onDoubleClick);
     window.removeEventListener("pointerleave", this.onPointerLeave);
     window.removeEventListener("blur", this.onPointerLeave);
   }

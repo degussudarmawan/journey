@@ -9,6 +9,54 @@ Legend: **✅ verified** = I actually looked at it rendering.
 
 ---
 
+## 2026-08-03 — The orbit is a space you can walk around in ✅
+
+`src/spiralEngine.js`
+
+The orbit stage was a 3D scene rendered from one fixed viewpoint. It's now a
+3D scene you can look around inside.
+
+- **Drag** — swing the camera (yaw + pitch, pitch clamped to 74°; past that
+  the ring is edge-on and there's nothing to see)
+- **Shift-drag** or right-drag — pan
+- **Double-click** — return to the default framing
+- Cursor shows `grab` / `grabbing` while free look is live
+
+**How.** All three orbit projections (the needles, the star core they leave
+behind, the key) now go through one `project(x, y, z)`. That single door is
+the whole design: put the camera anywhere else and you have to remember to
+apply it in each of them, and the one you miss stays welded to the screen
+while everything else swings past it. `viewDepth()` is the same transform
+without the divide, for painter ordering.
+
+Identity until the first drag, so the default composition is untouched.
+
+**Side effects**
+- **Painter ordering now sorts on VIEW-space depth, not world z.** It had to:
+  world z is only correct from the default camera, and swinging round behind
+  the ring inverted the order so far pieces painted over near ones.
+- **The star core was lifted into the space at z = 0.** Left in raw screen
+  space it hung rigidly in front while the ring turned behind it.
+- **Clicking is now resolved on pointerUP, not down.** A press is ambiguous —
+  pick, or the start of a camera swing — and only movement tells them apart.
+  A drag past 5px sets a flag that suppresses the pick on release.
+- **`startUnlock` eases the camera home.** The door is a fixed backdrop that
+  does *not* swing with the free look, and the key's flight ends at the world
+  origin — which is the keyhole only from the default view. Left rotated, the
+  key would fly to somewhere off the lock entirely. The clear-out and door
+  fade-in give it time to settle.
+- Scrolling out of the orbit resets the view; the star and word stages are
+  composed flat and have no free look to inherit.
+- **The detach sway carry-over is still a raw screen-space offset** (the
+  `stay > 0.001` branch). Under a rotated camera it nudges in slightly the
+  wrong direction. It's a small decaying transient during `toOrbit` only, so
+  it's invisible in practice — but it is the one thing not going through
+  `project()`.
+- Debug: `?yaw=0.9&pitch=0.5` starts the view already swung, so a viewpoint
+  can be reproduced or screenshotted without dragging.
+
+---
+
 ## 2026-08-03 — Hole sized to what shows, plate sized to what hides ✅
 
 `src/door3d.js`, `src/spiralEngine.js`

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { SpiralEngine, DEFAULT_PALETTE } from "./spiralEngine";
 import { SketchLayer } from "./sketchLayer";
 import { Door3D } from "./door3d";
+import { DotsGL } from "./dotsGL";
 import KeyPage from "./KeyPage";
 
 /**
@@ -30,6 +31,7 @@ export default function Spiral({
 }) {
   const canvasRef = useRef(null);
   const doorLayerRef = useRef(null);
+  const dotsLayerRef = useRef(null);
   const sketchCanvasRef = useRef(null);
   const trackRef = useRef(null);
   const hintRef = useRef(null);
@@ -92,6 +94,19 @@ export default function Spiral({
     const door3d = new Door3D(doorLayerRef.current);
     if (door3d.mount()) engine.door3d = door3d;
 
+    // Dots render as WebGL points by default. This is what lets the key be a
+    // real mesh sharing their depth buffer instead of a flat shape painted
+    // between whole pieces — see dotsGL.js.
+    //
+    // Canvas2D remains as an automatic fallback: if mount() fails there's no
+    // WebGL context to be had, engine.dotsGL stays null, and the 2D path takes
+    // over on its own. `?dots=2d` forces it for side-by-side comparison.
+    let dotsGL = null;
+    if (new URLSearchParams(window.location.search).get("dots") !== "2d") {
+      dotsGL = new DotsGL(dotsLayerRef.current);
+      if (dotsGL.mount()) engine.dotsGL = dotsGL;
+    }
+
     engine.mount();
 
     // Sketching is parked for now — it's headed for one of the key pages
@@ -114,6 +129,7 @@ export default function Spiral({
       engine.unmount();
       engineRef.current = null;
       door3d.unmount();
+      dotsGL?.unmount();
       sketch.unmount();
       sketchRef.current = null;
       window.removeEventListener("scroll", onScroll);
@@ -173,6 +189,13 @@ export default function Spiral({
               width: "100%",
               height: "100%",
             }}
+          />
+          {/* Prototype dot layer (?dots=gl). Sits directly under the 2D
+              particle canvas, which draws nothing in the stages GL has taken
+              over — only one of the two is ever producing dots. */}
+          <div
+            ref={dotsLayerRef}
+            style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
           />
           <canvas
             ref={canvasRef}

@@ -119,12 +119,18 @@ export class SpiralEngine {
     // is real 3D geometry on its own canvas behind this one; when null (no
     // WebGL) the 2D strip fallback in door.js draws it onto this canvas.
     this.door3d = null;
+    // Prototype: when set (?dots=gl), the star and orbit stages draw their
+    // halftone dots as WebGL points instead of to the 2D context. Everything
+    // else — positions, colours, ordering — is unchanged, so the two can be
+    // compared like for like. See dotsGL.js.
+    this.dotsGL = null;
     this.onUnlocked = null; // set by the host; fires when the door finishes opening
     // Debug: ?unlock=0.72 in the URL jumps straight to the orbit with a key
     // already selected and FREEZES the unlock at that fraction of the
     // sequence. Lets one moment of the door be inspected without scrolling
     // the whole track and clicking through every time. null = normal.
     this._debugU = null;
+    this._debugT = null; // ?t= pins scrollT, for comparing one stage
     // Free look inside the orbit. Identity by default, so the default framing
     // is exactly what it was before this existed. `t*` are the drag targets;
     // the un-prefixed values chase them (see updateView).
@@ -869,6 +875,50 @@ export class SpiralEngine {
     };
   }
 
+  /**
+   * Rotates a world point or vector into view space, without projecting.
+   * The GL scene lives in view space (the camera itself never moves), so
+   * anything handed to the GPU as geometry rather than as a screen position
+   * goes through here first.
+   */
+  viewRotate(x, y, z) {
+    const v = this.view;
+    const cy = Math.cos(v.yaw),
+      sy = Math.sin(v.yaw);
+    const cp = Math.cos(v.pitch),
+      sp = Math.sin(v.pitch);
+    const ax = x * cy + z * sy;
+    const az = z * cy - x * sy;
+    return { x: ax, y: y * cp - az * sp, z: az * cp + y * sp };
+  }
+
+  /**
+   * The key's placement on its orbiting piece, as an origin plus three axes,
+   * in the coordinates three.js wants.
+   *
+   * The 2D renderer gets away with a point-mapping function; a mesh needs a
+   * basis. Reading it off the same piece frame keeps the two in step:
+   *   mesh X -> the needle's width axis, mesh Y -> its long axis,
+   *   mesh Z -> its thickness. (buildKeyMesh already flipped the key's
+   *   authored y-down, which is why Y maps to +along and not -along.)
+   */
+  keyBasisForPiece(f) {
+    const len = f.slot.needleLen;
+    const s = (len / 2.4) * this.KEY_FIT; // key geometry is 2.4 units tall
+    const d = len / 2 - f.slot.anchorAlong; // key's middle at the needle's
+    const conv = (x, y, z) => {
+      const r = this.viewRotate(x, y, z);
+      // Engine y runs down and z runs away; three's run up and toward.
+      return [r.x, -r.y, -r.z];
+    };
+    return {
+      o: conv(f.px + d * f.ax, f.py + d * f.ay, f.pz + d * f.az),
+      x: conv(f.cx * s, f.cy * s, f.cz * s),
+      y: conv(f.ax * s, f.ay * s, f.az * s),
+      z: conv(f.ux * s, f.uy * s, f.uz * s),
+    };
+  }
+
   /** Just the view-space depth — for painter ordering, which can't use world z. */
   viewDepth(x, y, z) {
     const v = this.view;
@@ -1111,6 +1161,7 @@ export class SpiralEngine {
   selectPiece(k, elapsed) {
     if (k < 0) {
       this.selectedSlot = null;
+      this.selectedKey = null; // or the door would later build for a stale key
       return;
     }
     const spikeIdx = this.orbitSlots[k].spikeIdx;
@@ -1438,6 +1489,8 @@ export class SpiralEngine {
     const params = new URLSearchParams(window.location.search);
     const dbg = params.get("unlock");
     if (dbg !== null) this._debugU = this.clamp(parseFloat(dbg) || 0, 0, 1);
+    const dbgT = params.get("t");
+    if (dbgT !== null) this._debugT = this.clamp(parseFloat(dbgT) || 0, 0, 1);
     // Debug: ?yaw=0.7&pitch=0.4 starts the free look already swung round, so a
     // given viewpoint can be reproduced (or screenshotted) without dragging.
     const yaw = params.get("yaw");
@@ -1578,6 +1631,12 @@ export class SpiralEngine {
   // Converts the track element's scroll position into this.scrollT (0..1),
   // and fades the "Scroll" hint out over the first ~7% of scroll.
   onScroll() {
+    // Debug: ?t=0.35 pins the timeline, for comparing a single stage.
+    if (this._debugT !== null) {
+      this.scrollT = this._debugT;
+      if (this.hint) this.hint.style.opacity = "0";
+      return;
+    }
     if (this._debugU !== null) {
       // Park in the middle of orbitHold, wherever the page actually is.
       const st = this.stageDefs?.find((x) => x.kind === "orbitHold");
@@ -1610,6 +1669,12 @@ export class SpiralEngine {
     const ctx = this.ctx;
     const { w, h } = this.dims;
     ctx.clearRect(0, 0, w, h);
+    if (this.dotsGL) {
+      this.dotsGL.begin(w, h, this.ORBIT_FOCAL, {
+        x: this.view.panX,
+        y: this.view.panY,
+      });
+    }
     const t = this.scrollT || 0;
     const stage = this.getStage(t);
     const cx = w / 2,
@@ -1639,7 +1704,20 @@ export class SpiralEngine {
     // frame agrees on where the viewer is standing. Scrolling back out of the
     // orbit returns it to the default framing — the star and word stages are
     // composed flat and have no free look of their own to inherit it.
-    if (!inOrbit) this.resetView();
+    if (!inOrbit) {
+      this.resetView();
+      // Scrolling back out of the orbit puts everything back: a chosen key
+      // returns to being an ordinary spike, and an unlock in flight is
+      // abandoned rather than left running behind a hidden door — its clock
+      // would keep advancing and eventually fire onUnlocked at a viewer who
+      // has scrolled somewhere else entirely.
+      if (this.unlocking) this.resetUnlock();
+      else if (this.selectedSlot != null) this.selectPiece(-1, elapsed);
+      // The GL key is a persistent object in a scene, not marks on a canvas
+      // that gets cleared every frame, so leaving the stage that draws it is
+      // not enough to make it go away. It has to be dismissed.
+      this.dotsGL?.setKey(null);
+    }
     this.updateView();
 
     if (inOrbit && this.orbitGroups) {
@@ -1656,8 +1734,17 @@ export class SpiralEngine {
       this.orbitFrame(elapsed, stage.kind === "toOrbit" ? stage.mix : 1);
       ctx.fillStyle = this.INK;
 
-      const dot = (x, y, r) => {
+      const dot = (x, y, r, depth = 0) => {
         const rr = Math.max(0.45, r);
+        if (this.dotsGL) {
+          // Read the colour and alpha back off the 2D context rather than
+          // threading them through every call site. They're already correct
+          // there, and reading them guarantees the prototype is fed exactly
+          // what the canvas version would have drawn — which is the only way
+          // the comparison means anything.
+          this.dotsGL.push(x, y, rr, ctx.fillStyle, ctx.globalAlpha, depth);
+          return;
+        }
         if (rr < 1.6) {
           ctx.fillRect(x - rr, y - rr, rr * 2, rr * 2);
         } else {
@@ -1792,7 +1879,7 @@ export class SpiralEngine {
           }
           if (alpha <= 0.004) continue;
           ctx.globalAlpha = alpha;
-          dot(x, y, r);
+          dot(x, y, r, op.z);
         }
 
         // Drawn here, inside the piece's turn, so the solid key keeps its
@@ -1801,6 +1888,24 @@ export class SpiralEngine {
         // the leaves swing rather than leaving it hanging in the gap.
         const keyAlpha =
           keyFade * (1 - this.phase(u, this.U_SWING)) * (1 - this._keyHandoff);
+
+        // With GL dots the key is a mesh in the same scene, sharing their
+        // depth buffer — no painter ordering, no second renderer, and the
+        // dots in front of it genuinely occlude it. Only the ORBIT pose is
+        // handled here; once the unlock starts the key belongs to the door's
+        // scene, which owns the flight and the keyhole.
+        if (this.dotsGL) {
+          if (chosen && keyAlpha > 0.004 && u <= 0) {
+            this.dotsGL.setKey(
+              this.selectedKey,
+              this.keyBasisForPiece(f),
+              keyAlpha,
+            );
+            this._glKeyShown = true;
+          }
+          return;
+        }
+
         if (chosen && keyAlpha > 0.004) {
           const mid = keyProject(0, 0, 0); // key centre, for depth-scaled linework
           const lineScale = this.lerp(
@@ -1824,12 +1929,16 @@ export class SpiralEngine {
           // with the camera like everything else. Left in raw screen space it
           // would hang rigidly in front while the ring turned behind it.
           const sp = this.projectStarPoint(this.starPointFor(sub, elapsed));
-          dot(sp.x, sp.y, sub.dotR * sp.scale);
+          dot(sp.x, sp.y, sub.dotR * sp.scale, sp.z);
         }
       };
 
       // Far pieces, then the star core, then near pieces — the whole reason
       // the tilted ring reads as 3D rather than a flat overlapping mess.
+      // (With GL dots this ordering no longer matters for correctness, since
+      // the depth buffer resolves it; it's kept because the alpha-blended
+      // dots still look better drawn back to front.)
+      this._glKeyShown = false;
       let residueDrawn = false;
       for (const k of this._orbitOrder) {
         if (!residueDrawn && this._orbitFrames[k].z <= 0) {
@@ -1839,6 +1948,9 @@ export class SpiralEngine {
         drawPiece(k);
       }
       if (!residueDrawn) drawResidue();
+      // Nothing claimed the key this frame — deselected, or handed to the
+      // door. The mesh persists between frames, so it has to be told.
+      if (this.dotsGL && !this._glKeyShown) this.dotsGL.setKey(null);
 
       // The door has finished swinging: hand off to whatever shows the page.
       if (u >= 1 && !this._unlockFired) {
@@ -1847,7 +1959,7 @@ export class SpiralEngine {
       }
 
       ctx.globalAlpha = 1;
-      this.renderDoor3D(this.unlocking);
+      this.finishFrame(this.unlocking);
       this.raf = requestAnimationFrame(this.loop);
       return;
     }
@@ -1892,7 +2004,9 @@ export class SpiralEngine {
                 ? this.INK
                 : this.towardInk(palette[p.colorSlot], starPresence);
           }
-          if (r < 1.6) {
+          if (this.dotsGL) {
+            this.dotsGL.push(x, y, r, ctx.fillStyle, 1);
+          } else if (r < 1.6) {
             ctx.fillRect(x - r, y - r, r * 2, r * 2); // sub-pixel dots: a filled square reads sharper than a tiny circle
           } else {
             ctx.beginPath();
@@ -1947,20 +2061,27 @@ export class SpiralEngine {
         y = sy;
         r = p.dustR;
       }
-      ctx.beginPath();
-      ctx.fillStyle = p.colorSlot === -1 ? this.INK : palette[p.colorSlot];
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fill();
+      const fill = p.colorSlot === -1 ? this.INK : palette[p.colorSlot];
+      if (this.dotsGL) {
+        this.dotsGL.push(x, y, r, fill, 1);
+      } else {
+        ctx.beginPath();
+        ctx.fillStyle = fill;
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
 
-    this.renderDoor3D(false);
+    this.finishFrame(false);
     this.raf = requestAnimationFrame(this.loop);
   }
 
   /**
-   * Renders the 3D door layer, from whatever state this frame set on it.
-   * Called from every exit of loop() — the orbit branch returns early, so a
-   * single call at the bottom would miss precisely the stage the door is
+   * Flushes both WebGL layers — the prototype dot renderer and the door —
+   * from whatever state this frame set on them.
+   *
+   * Called from every exit of loop(). The orbit branch returns early, so a
+   * single call at the bottom would miss precisely the stage both layers are
    * shown in.
    *
    * @param {boolean} live whether an unlock is actually running right now.
@@ -1968,7 +2089,8 @@ export class SpiralEngine {
    *   page — hides the layer: unlike the 2D canvas it isn't cleared each
    *   frame, so a stale door would simply stay on screen.
    */
-  renderDoor3D(live) {
+  finishFrame(live) {
+    if (this.dotsGL) this.dotsGL.end();
     if (!this.door3d?.ok) return;
     if (!live) this.door3d.setState({ alpha: 0 });
     this.door3d.render();

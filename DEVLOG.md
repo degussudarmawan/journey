@@ -9,6 +9,171 @@ Legend: **✅ verified** = I actually looked at it rendering.
 
 ---
 
+## 2026-08-04 — WebGL is now the default renderer ✅
+
+`src/Spiral.jsx`
+
+Flipped after seeing the key comparison. GL renders the dots and the key on
+every page load; `?dots=2d` forces the old path for side-by-side checks.
+
+**Canvas2D is kept as an automatic fallback**, not deleted. If `DotsGL.mount()`
+fails there is no WebGL context to be had, `engine.dotsGL` stays null, and the
+2D path takes over on its own with no flag and no error. That costs nothing —
+the code is already written — and the alternative is a blank page on hardware
+that can't give us a context.
+
+So `keyRenderer.js` stays too. But **GL is now the source of truth**: new keys
+are authored and judged against the mesh renderer only. Nobody should be
+checking a key looks right in both.
+
+**Side effects**
+- The 2D canvas still clears every frame and then draws nothing. Harmless, and
+  it's what makes the fallback a one-line switch rather than a rewrite.
+- **Watch the edge-on legibility.** A flat sticker reads as a key from every
+  angle because it's lying about being 3D; a real solid seen edge-on looks
+  like an edge. Most visible when a key is on the far or near side of the
+  orbit. Fixes if it grates, both small: widen the key's extrusion depth, or
+  add a rim-light pass so the silhouette stays crisp against the background.
+
+---
+
+## 2026-08-04 — Migration: perspective camera + the key as a mesh ✅
+
+`src/dotsGL.js`, `src/spiralEngine.js`
+
+User's push: why wait, since everything gets easier once it's all one 3D
+space? Correct — and my "you're mid-way through door art" objection was weak,
+since the door is PNGs plus `door3d.js` and never touches the dot path.
+
+**Perspective camera.** `dotsGL` was orthographic, which has no depth for
+anything to test against. It now sits at exactly `ORBIT_FOCAL` from the z = 0
+plane with its field of view derived from that distance, so the GPU's divide
+and the engine's `f / (f + z)` are *the same function* rather than two things
+tuned to resemble each other. One consequence falls out for free: z = 0 maps
+1:1 to CSS pixels, so the flat stages (grid, spiral, words) are unchanged
+without a special case.
+
+**Dots carry depth.** `push()` now takes the view-space z and unprojects the
+screen position back to a world point. That indirection is deliberate: call
+sites nudge dots around in screen space (the clear-out fly-away, the cursor
+repel), and unprojecting at each dot's own depth reinterprets those nudges
+correctly instead of forcing all of them to be rewritten in world space.
+
+**The key is a mesh in the dots' scene**, sharing their depth buffer. It stops
+being painted between whole pieces and starts being resolved per pixel against
+every dot around it. `keyBasisForPiece()` reads the pose off the same piece
+frame the dots use — mesh X to the needle's width axis, Y to its long axis, Z
+to its thickness.
+
+Verified: orbit and word stages pixel-match the canvas version; the key sits
+correctly on its needle as a lit solid.
+
+**Side effects**
+- **The GL key has no outline.** The 2D renderer strokes a dark silhouette;
+  the mesh has bevels and lighting instead. A real visual difference — to my
+  eye better, reads as a solid object rather than a sticker — but it *is* a
+  change, and it's the one thing to look at before flipping the default.
+- Lights added to the dots scene for the key. The dots ignore them entirely
+  (ShaderMaterial, no lighting terms).
+- Painter ordering is now cosmetic rather than load-bearing: the depth buffer
+  resolves correctness. Kept because alpha-blended dots still look better
+  drawn back to front.
+- The GL key covers the **orbit pose only**. Once the unlock starts the key
+  belongs to the door's scene, which owns the flight and the keyhole. Two
+  scenes still, but one *renderer* and one key geometry.
+- Canvas remains the default and is byte-for-byte untouched — every change is
+  behind `if (this.dotsGL)`.
+
+**Left to finish the migration**
+1. Flip GL to default.
+2. Delete `keyRenderer.js` and the Canvas2D dot path (~200 lines gone).
+3. Optional: replace the hand-rolled free look with `OrbitControls`, now that
+   a real camera exists.
+
+---
+
+## 2026-08-03 — GL dot prototype now covers every stage ✅
+
+`src/spiralEngine.js`
+
+User's verdict on the prototype: "tbh they look the same." That was the only
+question blocking the migration, so the aesthetic risk is settled.
+
+Routed the remaining stages (grid, spiral, words) through the GL path too, so
+`?dots=gl` is now an end-to-end comparison with no renderer seam at the star
+boundary. Confirmed against Canvas2D at a spiral stage: same weight, same
+density, indistinguishable.
+
+Also added **`?t=0.30`** — pins `scrollT` so a single stage can be held still
+and compared. Sits alongside `?unlock=` and `?yaw=`/`?pitch=`.
+
+**Deliberately NOT done:** moving the key into the GL scene. That's where the
+value is — one key representation instead of two, compounding over the seven
+keys still to author — but it isn't a file move. The engine currently does its
+own projection: `project()` performs the perspective divide and `orbitDotPos`
+returns SCREEN coordinates. For the GPU to resolve depth between key and dots
+it needs raw world coordinates and a perspective camera, so `orbitDotPos`
+changes what it returns and every reader adapts — hit testing, the detach
+lerp, the star-point lifting. Worth doing, not worth starting mid-way through
+door artwork.
+
+**Side effects**
+- `?t=` bypasses the hint fade, so "SCROLL" stays visible in debug shots.
+  Cosmetic, debug-only.
+- Canvas remains the default. GL is still opt-in.
+
+---
+
+## 2026-08-03 — PROTOTYPE: halftone dots as WebGL points ✅
+
+`src/dotsGL.js` (new), `src/spiralEngine.js`, `src/Spiral.jsx`
+
+Not a migration — an experiment to answer one question before committing to
+one: **does a GL point sprite look like a Canvas2D dot?** Toggle with
+`?dots=gl`; default is unchanged.
+
+Everything except the rasteriser is held constant. The camera is orthographic
+and **1:1 with screen pixels**, fed exactly the coordinates the 2D renderer
+would have drawn at, and colour/alpha are read back off the 2D context at each
+call site rather than threaded through. Same numbers in, different rasteriser
+out — otherwise the comparison flatters whichever one you tuned last.
+
+### Result: viable, and the one real difference is fixable
+
+First pass came out visibly **smaller and grittier** than Canvas2D — more white
+showing through, forms reading sandy rather than inky. Cause found:
+
+> Most of these dots are **under a pixel across**. A point sprite can't be
+> smaller than one pixel, so asking for 0.9px and getting 1px silently *adds*
+> ink, while the hard edge removes the soft falloff Canvas2D gives a
+> fractional `fillRect`.
+
+Fixed by never drawing below 2px and giving the extra area back in alpha
+(squared, since coverage goes as the square of the width). That closed most of
+the gap. What remains is a slight hardness at the dot edges — close enough that
+you'd need the two side by side to call it.
+
+**Verdict: the aesthetic risk of the full migration is low.** The dot look
+survives, and the remaining gap is a shader tweak, not a dead end.
+
+**Side effects**
+- Bundle 756 kB → **798 kB** raw (220 kB gzipped) while the prototype is in
+  the tree. Deleting `dotsGL.js` returns it; committing to the migration would
+  more than pay it back by deleting `keyRenderer.js`.
+- `renderDoor3D` renamed **`finishFrame`** — it now flushes both WebGL layers,
+  and the old name lied about that.
+- Only the **star and orbit** stages route through GL. Word/spiral stages still
+  draw to canvas, so with `?dots=gl` the handoff at the star boundary is
+  visible. Expected: that boundary is the thing the migration removes.
+- The key still draws on the 2D canvas in both modes, so it does not interleave
+  by depth with GL dots. Real depth is the *prize* for migrating, not something
+  worth prototyping.
+- The `oklch()` palette can't be parsed by `THREE.Color`, so colours resolve
+  through a 1×1 canvas and a cache. Roundabout, but it's the only parser
+  guaranteed to understand every colour the app already uses.
+
+---
+
 ## 2026-08-03 — The orbit is a space you can walk around in ✅
 
 `src/spiralEngine.js`

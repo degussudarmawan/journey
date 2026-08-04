@@ -9,6 +9,46 @@ Legend: **✅ verified** = I actually looked at it rendering.
 
 ---
 
+## 2026-08-04 — Three unlock bugs ✅
+
+`src/spiralEngine.js`, `src/door3d.js`
+
+**1. The key vanished for the whole flight.** The GL mesh was gated to
+`u <= 0`, so it hid the moment the unlock began — and the door's own copy
+doesn't appear until the handoff near the end of the approach. Between those
+two there was simply no key. The 2D renderer used to cover that window and no
+longer runs.
+
+`keyUnlockProject` was split: `keyUnlockFrame` computes the frame, then
+`keyUnlockProject` wraps it as a point mapper (2D fallback) and
+`keyUnlockBasis` as a basis (GL mesh). Same frame, two consumers, so the
+flight can't diverge between them again.
+
+**2. Key and keyhole didn't fit.** The slot ran ~7× the shaft's half-width
+deep, but the key stops at the bore — so every pixel below it was empty dark
+that read as a second object sitting under the key rather than the hole it
+stands in. Slot shortened to 3.4×, bore and flare tightened to match.
+
+**3. The plate read as a sticker on the door art.** Enabled shadow mapping:
+the plate casts, the leaves receive. Nothing else anchors a raised object to
+the surface it rises from — the eye reads contact from the shadow, not from
+matching colour or lighting.
+
+**Side effects**
+- The shadow frustum is sized to the LOCK, not the door. A directional light's
+  shadow camera covers a fixed box, and one spanning the whole door would
+  spend its 1024px map on planking and leave the plate a shadow a few pixels
+  wide. Only the lock casts, so only the lock is covered.
+- Shadow map adds a second render pass per frame. Trivial here — one light,
+  a handful of meshes.
+- **The plate still overlaps the door ornament**, and that part is
+  composition, not code: the artwork has dense scrollwork right where the lock
+  goes. The shadow makes it read as *on top of* rather than *cut into*, which
+  is the honest relationship. To fix it properly, leave a clear oval at the
+  centre-seam of `colour.png` / `height.png` for the plate to sit in.
+
+---
+
 ## 2026-08-04 — WebGL is now the default renderer ✅
 
 `src/Spiral.jsx`

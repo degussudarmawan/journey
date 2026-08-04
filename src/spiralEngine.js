@@ -1300,7 +1300,7 @@ export class SpiralEngine {
   // (origin, axes, scale) rather than each point keeps the key rigid — a
   // straight per-point lerp would squash it flat halfway through, since the
   // start and end orientations are far apart.
-  keyUnlockProject(f, u) {
+  keyUnlockFrame(f, u) {
     const { w, h } = this.dims;
     const len = f.slot.needleLen;
 
@@ -1358,15 +1358,44 @@ export class SpiralEngine {
     const Y = mix3(y0, y1);
     const Z = mix3(z0, z1);
     const s = this.lerp(startScale, endScale, t);
+    return { O, X, Y, Z, s };
+  }
 
+  /** The unlock frame as a point mapper, for the 2D fallback renderer. */
+  keyUnlockProject(f, u) {
+    const { O, X, Y, Z, s } = this.keyUnlockFrame(f, u);
     return (kx, ky, kz) => {
       const ax = kx * s,
         ay = ky * s,
         az = kz * s;
-      const wx = O[0] + ax * X[0] + ay * Y[0] + az * Z[0];
-      const wy = O[1] + ax * X[1] + ay * Y[1] + az * Z[1];
-      const wz = O[2] + ax * X[2] + ay * Y[2] + az * Z[2];
-      return this.project(wx, wy, wz);
+      return this.project(
+        O[0] + ax * X[0] + ay * Y[0] + az * Z[0],
+        O[1] + ax * X[1] + ay * Y[1] + az * Z[1],
+        O[2] + ax * X[2] + ay * Y[2] + az * Z[2],
+      );
+    };
+  }
+
+  /**
+   * The same unlock frame as a basis for the GL mesh.
+   *
+   * Without this the key vanishes for the whole flight: the mesh only knew
+   * how to sit on an orbiting piece, and the door's own copy doesn't appear
+   * until the handoff at the end of the approach.
+   */
+  keyUnlockBasis(f, u) {
+    const { O, X, Y, Z, s } = this.keyUnlockFrame(f, u);
+    const conv = (x, y, z) => {
+      const r = this.viewRotate(x, y, z);
+      return [r.x, -r.y, -r.z];
+    };
+    return {
+      o: conv(O[0], O[1], O[2]),
+      x: conv(X[0] * s, X[1] * s, X[2] * s),
+      // buildKeyMesh already flipped the key's authored y-down, so the mesh's
+      // Y axis is the negative of the frame's.
+      y: conv(-Y[0] * s, -Y[1] * s, -Y[2] * s),
+      z: conv(Z[0] * s, Z[1] * s, Z[2] * s),
     };
   }
 
@@ -1895,12 +1924,14 @@ export class SpiralEngine {
         // handled here; once the unlock starts the key belongs to the door's
         // scene, which owns the flight and the keyhole.
         if (this.dotsGL) {
-          if (chosen && keyAlpha > 0.004 && u <= 0) {
-            this.dotsGL.setKey(
-              this.selectedKey,
-              this.keyBasisForPiece(f),
-              keyAlpha,
-            );
+          if (chosen && keyAlpha > 0.004) {
+            // Riding the ring, or flying the unlock path — same mesh either
+            // way, just a different frame. Once _keyHandoff completes the
+            // door's scene takes the key over, and keyAlpha has already
+            // faded this copy out.
+            const basis =
+              u > 0 ? this.keyUnlockBasis(f, u) : this.keyBasisForPiece(f);
+            this.dotsGL.setKey(this.selectedKey, basis, keyAlpha);
             this._glKeyShown = true;
           }
           return;

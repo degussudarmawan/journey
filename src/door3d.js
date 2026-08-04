@@ -200,6 +200,67 @@ function envCanvas() {
   return c;
 }
 
+/**
+ * Returns a copy of a leaf map with the lock's footprint cleared to plain
+ * planking.
+ *
+ * Without this the ornament runs straight under the escutcheon and the lock
+ * reads as a separate object dropped on top of the door rather than part of
+ * it. Real ironwork is laid out AROUND the lock; this does that for whatever
+ * artwork happens to be loaded, instead of asking the artwork to leave a gap.
+ *
+ * The fill colour is sampled from a ring just outside the cleared area, so it
+ * matches its surroundings whether that's the procedural planking or a custom
+ * PNG. Feathered at the rim, because a hard-edged patch is just a different
+ * pasted-on shape.
+ *
+ * The ellipse is centred on the SEAM edge, so each leaf carries half of it and
+ * the two together make one clearing around the lock.
+ */
+function clearLockField(src, W, H, halfW, halfH) {
+  const out = makeCanvas(src.width, src.height);
+  const ctx = out.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(src, 0, 0);
+
+  // The leaf map covers a leaf of W/2 x H world pixels, whatever its own
+  // resolution is — custom art won't match the viewport.
+  const rx = halfW * (src.width / (W / 2));
+  const ry = halfH * (src.height / H);
+  const cx = src.width; // the seam
+  const cy = src.height / 2;
+
+  let r = 0,
+    g = 0,
+    b = 0,
+    n = 0;
+  for (let i = 0; i < 24; i++) {
+    const a = (i / 24) * Math.PI * 2;
+    const px = Math.round(cx + Math.cos(a) * rx * 1.25);
+    const py = Math.round(cy + Math.sin(a) * ry * 1.25);
+    if (px < 0 || py < 0 || px >= src.width || py >= src.height) continue;
+    const d = ctx.getImageData(px, py, 1, 1).data;
+    r += d[0];
+    g += d[1];
+    b += d[2];
+    n++;
+  }
+  if (!n) return out;
+  const fill = `rgb(${Math.round(r / n)},${Math.round(g / n)},${Math.round(b / n)})`;
+
+  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(rx, ry));
+  grad.addColorStop(0, fill);
+  grad.addColorStop(0.82, fill);
+  grad.addColorStop(1, fill.replace("rgb(", "rgba(").replace(")", ",0)"));
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.fillStyle = grad;
+  ctx.fillRect(cx - rx, cy - ry, rx * 2, ry * 2);
+  ctx.restore();
+  return out;
+}
+
 /** What lies behind the door, revealed as it parts. */
 function backdropCanvas() {
   const c = makeCanvas(512, 512);
@@ -276,6 +337,12 @@ export class Door3D {
     }
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.setClearAlpha(0);
+    // Shadows exist for one reason: to stop the lock plate reading as a
+    // sticker laid over the door art. Nothing else anchors a raised object to
+    // the surface it's raised from — matching colours and lighting doesn't do
+    // it, because the eye reads contact from the shadow, not the shading.
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(FOV, 1, 1, 40000);
@@ -292,6 +359,10 @@ export class Door3D {
     // consistent direction to throw its highlights and shadows against.
     const key = new THREE.DirectionalLight(0xfff3e2, 2.1);
     key.position.set(-0.55, 0.8, 1);
+    key.castShadow = true;
+    key.shadow.mapSize.set(1024, 1024);
+    key.shadow.bias = -0.0006;
+    this.keyLight = key; // shadow frustum is sized to the lock in _build()
     const fill = new THREE.DirectionalLight(0x93a6ff, 0.55);
     fill.position.set(0.9, -0.3, 0.6);
     this.scene.add(key, fill, new THREE.AmbientLight(0xffffff, 0.5));
@@ -424,12 +495,14 @@ export class Door3D {
     this.leftPivot.position.set(-W / 2, 0, 0);
     const left = new THREE.Mesh(geo, mats(false));
     left.position.x = leafW / 2;
+    left.receiveShadow = true; // takes the lock plate's shadow
     this.leftPivot.add(left);
 
     this.rightPivot = new THREE.Group();
     this.rightPivot.position.set(W / 2, 0, 0);
     const right = new THREE.Mesh(geo, mats(true));
     right.position.x = -leafW / 2;
+    right.receiveShadow = true;
     this.rightPivot.add(right);
 
     this.root.add(this.leftPivot, this.rightPivot);
@@ -466,10 +539,13 @@ export class Door3D {
     const lk = keyDef?.lock;
     const hole = lk
       ? {
-          r: lk.shaftHalf * 1.75 * keyScale, // bore: the stem, with clearance
-          halfTop: lk.shaftHalf * 1.25 * keyScale,
-          halfBot: lk.shaftHalf * 2.1 * keyScale, // a modest ward flare
-          yBot: -lk.shaftHalf * 7 * keyScale,
+          r: lk.shaftHalf * 1.45 * keyScale, // bore: the stem, with clearance
+          halfTop: lk.shaftHalf * 1.1 * keyScale,
+          halfBot: lk.shaftHalf * 1.8 * keyScale, // a modest ward flare
+          // Short. The key stops at the bore, so every pixel of slot below it
+          // is empty dark that reads as a second object sitting under the key
+          // rather than as the hole the key is standing in.
+          yBot: -lk.shaftHalf * 3.4 * keyScale,
         }
       : { r: 14, halfTop: 8, halfBot: 14, yBot: -46 }; // keyless spikes
     // Wide enough that the bit stays behind it. escutcheonShape's outline

@@ -26,6 +26,8 @@
    ---------------------------------------------------------------------------
    ============================================================================ */
 
+import { DOOR_LOCK_Y } from "./doorAssets";
+
 /**
  * The two palettes. Every painter reads from the active one (`C`), never from
  * a literal, which is what lets the height pass reuse the colour pass's code.
@@ -499,7 +501,7 @@ export function drawDoor(ctx, art, W, H, open, plateAlpha = 1) {
     ctx.drawImage(
       es,
       W / 2 - es.width / 2,
-      H / 2 - es.height * ESCUTCHEON_KEYHOLE_Y,
+      H * DOOR_LOCK_Y - es.height * ESCUTCHEON_KEYHOLE_Y,
       es.width,
       es.height,
     );
@@ -509,5 +511,5 @@ export function drawDoor(ctx, art, W, H, open, plateAlpha = 1) {
 
 /** Where the keyhole sits on screen — the key aims for this. */
 export function keyholePoint(W, H) {
-  return { x: W / 2, y: H / 2 };
+  return { x: W / 2, y: H * DOOR_LOCK_Y };
 }

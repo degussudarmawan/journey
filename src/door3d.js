@@ -34,11 +34,16 @@
 
 import * as THREE from "three";
 import { buildDoorMaps } from "./door";
-import { buildKeyMesh } from "./key3d";
-import { DOOR_ASSETS, DOOR_RELIEF, DOOR_RELIEF_INVERT } from "./doorAssets";
+import { lockMetrics } from "./lock3d";
+import {
+  DOOR_ASSETS,
+  DOOR_LOCK_Y,
+  DOOR_RELIEF,
+  DOOR_RELIEF_INVERT,
+} from "./doorAssets";
 
 const FOV = 42; // vertical field of view, degrees
-const LEAF_DEPTH_FRAC = 0.014; // leaf thickness, as a fraction of door height
+export const LEAF_DEPTH_FRAC = 0.014; // leaf thickness, as a fraction of door height
 const OPEN_ANGLE = Math.PI * 0.62; // how far the leaves swing when fully open
 const NORMAL_MAP_SCALE = 0.5; // relief is low-frequency; half-res is plenty
 
@@ -227,35 +232,53 @@ function clearLockField(src, W, H, halfW, halfH) {
   const rx = halfW * (src.width / (W / 2));
   const ry = halfH * (src.height / H);
   const cx = src.width; // the seam
-  const cy = src.height / 2;
+  const cy = src.height * DOOR_LOCK_Y;
 
   let r = 0,
     g = 0,
     b = 0,
     n = 0;
-  for (let i = 0; i < 24; i++) {
-    const a = (i / 24) * Math.PI * 2;
-    const px = Math.round(cx + Math.cos(a) * rx * 1.25);
-    const py = Math.round(cy + Math.sin(a) * ry * 1.25);
-    if (px < 0 || py < 0 || px >= src.width || py >= src.height) continue;
-    const d = ctx.getImageData(px, py, 1, 1).data;
-    r += d[0];
-    g += d[1];
-    b += d[2];
-    n++;
+  // Sample over several radii, not one ring: a single ring can land entirely
+  // on ornament or entirely between it, and either way the patch comes out
+  // visibly lighter or darker than the field it's sitting in.
+  for (const k of [1.15, 1.35, 1.6]) {
+    for (let i = 0; i < 24; i++) {
+      const a = (i / 24) * Math.PI * 2;
+      const px = Math.round(cx + Math.cos(a) * rx * k);
+      const py = Math.round(cy + Math.sin(a) * ry * k);
+      if (px < 0 || py < 0 || px >= src.width || py >= src.height) continue;
+      const d = ctx.getImageData(px, py, 1, 1).data;
+      r += d[0];
+      g += d[1];
+      b += d[2];
+      n++;
+    }
   }
   if (!n) return out;
   const fill = `rgb(${Math.round(r / n)},${Math.round(g / n)},${Math.round(b / n)})`;
 
   const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(rx, ry));
   grad.addColorStop(0, fill);
-  grad.addColorStop(0.82, fill);
+  grad.addColorStop(0.7, fill);
   grad.addColorStop(1, fill.replace("rgb(", "rgba(").replace(")", ",0)"));
   ctx.save();
   ctx.beginPath();
   ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
   ctx.clip();
   ctx.fillStyle = grad;
+  ctx.fillRect(cx - rx, cy - ry, rx * 2, ry * 2);
+
+  // Contact shadow, painted rather than cast. The plate lives in the dots
+  // scene now, so it can't throw a real shadow onto these leaves — but
+  // without one it floats, and the eye reads contact from the shadow more
+  // than from anything else. Offset down and right to match the key light.
+  const sx = cx + rx * 0.1;
+  const sy = cy + ry * 0.12;
+  const sh = ctx.createRadialGradient(sx, sy, 0, sx, sy, Math.max(rx, ry) * 0.95);
+  sh.addColorStop(0, "rgba(0,0,0,0.34)");
+  sh.addColorStop(0.55, "rgba(0,0,0,0.16)");
+  sh.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = sh;
   ctx.fillRect(cx - rx, cy - ry, rx * 2, ry * 2);
   ctx.restore();
   return out;
@@ -438,16 +461,36 @@ export class Door3D {
       return x;
     };
 
+    // ---- lock sizing ----
+    // The lock's own geometry now lives in the dots scene (see lock3d.js), so
+    // the key can be ONE mesh under ONE set of lights for the whole sequence.
+    // Its dimensions are still needed here, though: the leaf artwork has to
+    // have the lock's footprint cleared out of it.
+    const lockM = lockMetrics(keyDef, keyScale, W, H);
+
     // ---- leaves ----
     const leafW = W / 2;
     const depth = Math.max(6, H * LEAF_DEPTH_FRAC);
     const geo = track(new THREE.BoxGeometry(leafW, H, depth));
 
-    const colourTex = track(tex(leafColour, { srgb: true }));
-    const normalTex = leafHeight
-      ? track(tex(heightToNormal(leafHeight, DOOR_RELIEF)))
+    // Clear the ornament out from under the lock, so the ironwork reads as
+    // laid out around it rather than running behind it. A shade larger than
+    // the plate, leaving a thin margin of plain planking that shows the two
+    // belong to the same surface.
+    const fieldW = lockM.pw * 0.72;
+    const fieldH = lockM.ph * 0.62;
+    const clearedColour = clearLockField(leafColour, W, H, fieldW, fieldH);
+    const clearedHeight = leafHeight
+      ? clearLockField(leafHeight, W, H, fieldW, fieldH)
       : null;
-    const specTex = leafHeight ? track(tex(heightToSpec(leafHeight))) : null;
+
+    const colourTex = track(tex(clearedColour, { srgb: true }));
+    const normalTex = clearedHeight
+      ? track(tex(heightToNormal(clearedHeight, DOOR_RELIEF)))
+      : null;
+    const specTex = clearedHeight
+      ? track(tex(heightToSpec(clearedHeight)))
+      : null;
 
     const edge = track(
       new THREE.MeshStandardMaterial({
@@ -519,199 +562,6 @@ export class Door3D {
     back.position.z = -H * 0.75;
     this.root.add(back);
 
-    // ---- lock ----
-    // Real geometry, not a picture of a lock: the plate is an extruded shield
-    // with the keyhole as an actual void through it, and a socket recedes
-    // behind that void so the hole has an inside.
-    // THE HOLE IS SIZED TO WHAT SHOWS; THE PLATE IS SIZED TO WHAT MUST HIDE.
-    //
-    // These are two different measurements and conflating them wrecks the
-    // look. The obvious move is to make the slot admit the whole bit — that's
-    // what a real warded keyhole does — but this key's bit is nearly six times
-    // its stem's width, so an honest slot is a giant funnel with a keyhole at
-    // the top of it. It's correct and it looks awful.
-    //
-    // The bit doesn't have to fit through the hole. It has to *disappear*, and
-    // the plate is opaque, so the depth buffer already hides anything sitting
-    // behind it. So: the bore is sized to the stem, which is the only part
-    // anyone actually sees enter, and the plate is made broad enough to
-    // swallow the bit. Classic keyhole silhouette, nothing poking out.
-    const lk = keyDef?.lock;
-    const hole = lk
-      ? {
-          r: lk.shaftHalf * 1.45 * keyScale, // bore: the stem, with clearance
-          halfTop: lk.shaftHalf * 1.1 * keyScale,
-          halfBot: lk.shaftHalf * 1.8 * keyScale, // a modest ward flare
-          // Short. The key stops at the bore, so every pixel of slot below it
-          // is empty dark that reads as a second object sitting under the key
-          // rather than as the hole the key is standing in.
-          yBot: -lk.shaftHalf * 3.4 * keyScale,
-        }
-      : { r: 14, halfTop: 8, halfBot: 14, yBot: -46 }; // keyless spikes
-    // Wide enough that the bit stays behind it. escutcheonShape's outline
-    // reaches about 0.34 * pw at its widest, hence the 3.2.
-    const bitHalf = (lk?.bitHalf ?? 0) * keyScale;
-    const pw = Math.max(Math.round(Math.min(W, H) * 0.075), Math.round(bitHalf * 3.2));
-    // Long enough that the bit's tip stays behind it too — the outline's
-    // bottom sits at -0.55 * ph, so it has to clear the deepest point of the
-    // key with margin, or the tip juts out below the plate.
-    const bitDrop = (lk ? lk.bitBottom - lk.pivotY : 0) * keyScale;
-    const ph = Math.max(pw * 1.45, bitDrop * 2.1, -hole.yBot * 2.5);
-    const pd = pw * 0.13; // how far the plate stands off the door
-    const sd = pw * 0.75; // how deep the keyhole bores in
-    this.plate = new THREE.Group();
-    this.plate.position.set(0, 0, depth / 2); // keyhole on the world origin
-
-    const ironMat = track(
-      new THREE.MeshStandardMaterial({
-        // A metal's base colour is its SPECULAR TINT, not a diffuse paint:
-        // at metalness 1 there is no diffuse term at all, so a dark colour
-        // yields a dark mirror no matter how much light you add. The old
-        // 0x3a3a46 was the black blob. Real iron reflects ~55%, so it has to
-        // be a mid tone here and gets its darkness from the scene instead.
-        color: 0x9298ad,
-        metalness: 0.85,
-        roughness: 0.28,
-        envMapIntensity: 1.4,
-        transparent: true,
-      }),
-    );
-    const plate = new THREE.Mesh(
-      track(
-        new THREE.ExtrudeGeometry(escutcheonShape(pw, ph, hole), {
-          depth: pd,
-          bevelEnabled: true,
-          bevelThickness: pd * 0.45,
-          bevelSize: pd * 0.45,
-          bevelSegments: 4,
-          curveSegments: 24,
-        }),
-      ),
-      ironMat,
-    );
-
-    // The socket is the keyhole profile extruded backwards and rendered from
-    // the INSIDE (BackSide), which turns a solid into a cavity — you see its
-    // walls receding and its floor, and they shade as the lighting changes.
-    //
-    // depthTest is off because the door leaf is a solid slab occupying that
-    // space: without it the leaf's front face wins and the hole looks painted
-    // on. renderOrder then does the sequencing by hand — leaf, socket, plate,
-    // key — which is safe precisely because the socket's silhouette is the
-    // keyhole, so it can only ever show through the plate's own void.
-    const socketMat = track(
-      new THREE.MeshStandardMaterial({
-        color: 0x1b1b24,
-        metalness: 0.45,
-        roughness: 0.85,
-        transparent: true,
-        side: THREE.BackSide,
-        depthTest: false,
-        // Must not write depth either. The key is occluded by the DOOR LEAF's
-        // depth as it sinks in — that is what makes it vanish into the
-        // surface — and a socket writing depth would break that.
-        depthWrite: false,
-      }),
-    );
-    const socket = new THREE.Mesh(
-      track(
-        new THREE.ExtrudeGeometry(keyholeShape(hole), {
-          depth: sd,
-          bevelEnabled: false,
-          curveSegments: 24,
-        }),
-      ),
-      socketMat,
-    );
-    socket.position.z = -sd; // bore inward from the door's surface
-    socket.renderOrder = 1;
-    plate.renderOrder = 2;
-    this.plate.add(socket, plate);
-    this._plateMats = [ironMat, socketMat];
-
-    this.root.add(this.plate);
-
-    // ---- key ----
-    if (keyDef) {
-      const built = buildKeyMesh(keyDef);
-      this._key = built;
-      this._disposables.push(built);
-      // Three nested frames, because insertion is three separate motions and
-      // stacking them keeps each one a single number:
-      //   keyPivot — sits at the keyhole; TILTS the key to face into the door
-      //   keySpin  — rotates about the shaft: the actual turning of the key
-      //   object   — slides ALONG the shaft: how deep it has gone in
-      this.keyPivot = new THREE.Group();
-      this.keySpin = new THREE.Group();
-      this.keySpin.add(built.object);
-      this.keyPivot.add(this.keySpin);
-      this.keyPivot.visible = false;
-      // renderOrder is per-object and does NOT inherit from a Group, so this
-      // has to reach the meshes themselves. The key must come after the
-      // socket, which draws with depthTest off and would otherwise paint its
-      // dark interior straight over the shaft standing in the hole.
-      built.object.traverse((o) => {
-        o.renderOrder = 3;
-      });
-      // Must clear the plate's FRONT face, bevel included — the extrusion runs
-      // from -bevelThickness to depth+bevelThickness, so "depth/2 + pd" is
-      // still buried inside it and the plate simply drew over the key. That
-      // was the black thing in front of it.
-      this._keyZOut = depth / 2 + pd * 1.3 + Math.max(5, pd * 0.6);
-      // Seated: the point in the hole sits at the plate's MID-DEPTH, not
-      // behind it. The key is pitched over, so the shaft climbs in z as it
-      // rises out of the hole — from mid-depth it clears the plate's front
-      // face almost immediately, while anything below the hole is already
-      // inside. Park it further back and the plate hides the shaft too, which
-      // leaves only the bow poking over the top edge like a badge.
-      this._keyZIn = depth / 2 + pd * 0.5;
-      this.root.add(this.keyPivot);
-    }
-  }
-
-  /**
-   * Poses the key for this frame. Everything is in the key's own authored
-   * units (total height 2.4); `scale` converts to screen pixels.
-   *
-   * @param {object} s
-   * @param {boolean} s.show    whether the 3D key has taken over from the 2D one
-   * @param {number}  s.scale   world units per key unit
-   * @param {number}  s.pivotY  the point along the key currently at the keyhole
-   * @param {number}  s.insert  0 = flat against the door, 1 = fully seated
-   * @param {number}  s.tilt    radians to pitch the key into the door
-   * @param {number}  s.turn    radians of rotation about the shaft
-   * @param {number}  s.alpha   opacity
-   */
-  setKey(s) {
-    if (!this.keyPivot) return;
-    this.keyPivot.visible = !!s.show && s.alpha > 0.01;
-    if (!this.keyPivot.visible) return;
-
-    // How far along the shaft the lock has swallowed. Sliding the key along
-    // its own axis is what "inserting" means; the tilt below is what aims
-    // that axis into the door.
-    // Offset by the SHAFT AXIS, not the key's centre. The bow and scrolls hang
-    // to one side, so centring the bounding box would stand the key in the
-    // lock visibly crooked.
-    this._key.object.position.set(-s.pivotX, s.pivotY, 0);
-    this.keyPivot.scale.setScalar(s.scale);
-    this.keyPivot.position.set(
-      0,
-      0,
-      this._keyZOut + (this._keyZIn - this._keyZOut) * s.insert,
-    );
-
-    // Pitching about X swings the bit away from the viewer and into the door,
-    // leaving the bow out front — the pose you actually see on a key in a
-    // lock. It stops short of 90 degrees on purpose: a key pointing exactly
-    // down the view axis projects to a bare horizontal line, since its whole
-    // length collapses to nothing. Short of that, perspective makes the near
-    // bow large and the buried end small, which is what sells the depth.
-    this.keyPivot.rotation.x = s.tilt;
-    // Turning happens about the shaft, so it stays a real turn at any tilt.
-    this.keySpin.rotation.y = s.turn;
-
-    for (const m of this._key.materials) m.opacity = s.alpha;
   }
 
   /**
@@ -739,11 +589,6 @@ export class Door3D {
     const angle = this.state.open * OPEN_ANGLE;
     if (this.leftPivot) this.leftPivot.rotation.y = -angle;
     if (this.rightPivot) this.rightPivot.rotation.y = angle;
-    if (this._plateMats) {
-      const pa = this.state.plateAlpha;
-      for (const m of this._plateMats) m.opacity = pa;
-      this.plate.visible = pa > 0.01;
-    }
     this.renderer.render(this.scene, this.camera);
   }
 
@@ -751,11 +596,7 @@ export class Door3D {
     if (this.root) this.root.clear();
     for (const d of this._disposables) d.dispose?.();
     this._disposables = [];
-    this.leftPivot = this.rightPivot = this.plate = null;
-    this.keyPivot = null;
-    this._key = null;
-    this._keyClip = null;
-    this._plateMats = null;
+    this.leftPivot = this.rightPivot = null;
   }
 
   unmount() {

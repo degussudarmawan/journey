@@ -9,6 +9,192 @@ Legend: **✅ verified** = I actually looked at it rendering.
 
 ---
 
+## 2026-08-06 — Flight was landing behind the plate ✅
+
+`src/spiralEngine.js`, `src/dotsGL.js`
+
+Second half of the same bug, in a different phase. `keyUnlockFrame`'s endpoint
+had **z = 0** — the door's own plane. But the lock plate stands proud of that
+surface, so the key spent the whole late approach behind it and then snapped
+forward at the handoff to the seated pose.
+
+The flight now ends at `dotsGL.keyRestZ()`, the same z the seated pose starts
+from, so the two phases meet instead of jumping.
+
+**Side effects**
+- The engine now asks `dotsGL` where the lock's front face is. A CPU-side
+  animation reading a number out of the renderer isn't lovely, but the
+  alternative is the engine recomputing plate geometry it has no other reason
+  to know about — and *that* is exactly the kind of duplicate that let these
+  two phases disagree in the first place.
+- `keyRestZ()` returns 0 before the lock is built. Harmless: nothing flies
+  until a key is selected, and selecting one builds the lock.
+
+---
+
+## 2026-08-06 — Key was lying behind the lock ✅
+
+`src/dotsGL.js`
+
+The seated key's pivot sat at the plate's **mid-depth** (`pd * 0.5`). But the
+extrusion runs out to `1.45 * pd` once the bevel is counted, and the key only
+climbs in z as it rises out of the hole — so a long stretch of shaft was buried
+under the plate's front face. The key read as lying behind the lock instead of
+standing in it.
+
+Pivot moved to `pd * 1.15`, just inside the front face. Everything below the
+hole is still hidden, which is the part that should be.
+
+Also pinned `renderOrder` on the lock and the key. Both are transparent (they
+fade with the door) and three sorts the transparent pass by centroid distance,
+which flips as the key tilts past the plate. The depth buffer still does the
+real occlusion; this just stops the sort order from having a vote.
+
+**Side effects**
+- The key sinks visibly less far now. It's the difference between "in the
+  lock" and "swallowed by it", but if the insertion wants to feel deeper,
+  `_keyZIn` is the number and `1.15` is the floor before the shaft starts
+  disappearing again.
+
+---
+
+## 2026-08-05 — Fallout from the single-mesh refactor ✅
+
+`src/dotsGL.js`, `src/spiralEngine.js`
+
+**1. State leaked between the two pose modes.** One mesh now serves both, but
+they drive *different properties*: the orbit/flight pose writes a matrix on the
+object, the seated pose writes scale and rotations on the pivots. Whatever one
+set stayed set when the other took over — and `keyPivot.scale` is around 100,
+so the next basis pose multiplied its own scale by that again. A key a hundred
+times too big.
+
+`_resetKeyFrames()` now clears every frame to identity before either mode
+applies its transform, which makes them independent rather than merely ordered.
+Two modes sharing one object is fine; two modes sharing one object and each
+assuming the other's leftovers is not.
+
+**2. The key was oversized against its plate.** `KEY_DOOR_SCALE` 0.32 → 0.26.
+
+**3. The flight passed through edge-on.** Position and orientation were blended
+at the same rate, which drags the key through edge-on around halfway — and a
+real solid seen edge-on is a sliver. The flat 2D key never had this problem
+because it always drew its full silhouette regardless of angle. Orientation now
+leads (`tA = t * 1.9`), so the key turns face-on in the first half of the
+approach and stays readable for the part anyone watches.
+
+**Side effects**
+- Front-loading the orientation means the key is face-on well before it
+  arrives, so the last half of the flight is pure translation. Reads as
+  "presented, then delivered" — deliberate, but it is a different rhythm from
+  a uniform blend.
+- `_resetKeyFrames` runs per frame. Nine property writes; nothing.
+
+---
+
+## 2026-08-04 — One key mesh, not two ✅
+
+`src/lock3d.js` (new), `src/dotsGL.js`, `src/door3d.js`, `src/spiralEngine.js`
+
+User spotted it: "the light reflection suddenly changing so weird." There were
+**two** key meshes — one in the dots scene for the orbit and flight, one in the
+door's for the seat and turn — and the two scenes had different lighting (an
+environment map and a fill light on one side only). The key changed material
+as it crossed. Not subtle once you know to look.
+
+The structural cause: a mesh can only be in one scene, and the key has to be
+occluded by *dots* while it orbits and by the *plate* while it enters. So the
+fix wasn't to match the lighting, it was to stop needing two scenes for the
+key at all — **the lock moved to the dots scene** (`lock3d.js`), and the key
+now lives there permanently under one set of lights.
+
+The door leaves stayed behind on their own canvas. They never needed to
+interleave with the key by depth: the plate is always in front of them, and
+fades out before they swing.
+
+**Side effects**
+- **The plate's real cast shadow is gone** — it isn't in the leaves' scene any
+  more. Replaced with a painted contact shadow baked into the cleared field.
+  Cheaper, and indistinguishable at this angle, but it will not track the
+  light if the rig ever changes.
+- The socket dropped its `depthTest: false` / `renderOrder` hack. That existed
+  only because the door leaf was a solid slab in the same scene winning the
+  depth test; there's no leaf here, so ordinary depth works and the socket's
+  own far cap supplies the dark floor. **A genuinely simpler result.**
+- `dotsGL`'s lighting was raised to match `door3d`'s exactly (env map, key,
+  fill, ambient) so the plate and the leaves still read as one piece of
+  ironmongery across the two canvases. That pairing is now the thing to keep
+  in sync — one object, two scenes, same failure mode as before if they drift.
+- `door3d` is leaves + backdrop only. It still computes `lockMetrics`, but
+  purely to know where to clear the artwork.
+- `LEAF_DEPTH_FRAC` is exported and shared: the plate stands off that surface
+  and has to agree with it.
+
+---
+
+## 2026-08-04 — Lock position is a knob, not a constant ✅
+
+`src/doorAssets.js`, `src/door3d.js`, `src/spiralEngine.js`, `src/door.js`
+
+The lock was hard-coded to the door's vertical centre, which on this artwork
+lands squarely on the middle scrollwork. Clearing a field around it helped but
+couldn't fix it — **the code can't invent space the design doesn't have.**
+Where the lock goes is a property of the artwork, so it belongs with the
+artwork.
+
+New `DOOR_LOCK_Y` in `doorAssets.js`: the keyhole's height as a fraction of
+the door, 0.5 being dead centre. Set to **0.4**, the gap between the top strap
+and the middle scrollwork in the current art.
+
+**Side effects**
+- **Four things had to follow it**, and missing any one leaves the key flying
+  at a lock that isn't there:
+  - the plate group (`door3d._lockY`)
+  - the seated key (`setKey`'s pivot)
+  - the cleared ornament field (`clearLockField`'s ellipse centre)
+  - the key's flight endpoint (`keyUnlockFrame`'s `o1`)
+  Plus `keyholePoint` and the escutcheon placement in the 2D fallback.
+- **The world origin is no longer the keyhole.** That assumption was baked in
+  everywhere and is now wrong — anything new that aims at the lock must add
+  the offset rather than targeting (0, 0).
+- Move the ornament in the artwork and this needs moving too. It is not
+  derived from the art, just aimed at it.
+
+---
+
+## 2026-08-04 — The lock is part of the door now ✅
+
+`src/door3d.js`
+
+The escutcheon floated over the ornament — the ironwork ran straight under it,
+so the lock read as a separate object dropped on the door instead of part of
+it. My earlier answer ("leave a gap in your artwork") was the wrong place to
+solve it: real ironwork is laid out AROUND the lock, and the code can do that
+for whatever art happens to be loaded.
+
+`clearLockField()` copies each leaf map and clears an ellipse at the seam,
+centred on the lock. The fill colour is **sampled from rings just outside the
+cleared area**, so it matches its surroundings whether that's the procedural
+planking or a custom PNG — no hard-coded colour that only works for one door.
+Feathered at the rim, since a hard-edged patch is just a different pasted-on
+shape. Applied to colour and height alike, so the relief is cleared too.
+
+The ellipse is centred on the seam edge, so each leaf carries half and the two
+together make one clearing.
+
+**Side effects**
+- **Lock sizing moved above the leaves** in `_build`. The leaf artwork now
+  depends on the lock's dimensions, so it can't be computed after them.
+- Sampling reads pixels at three radii, not one ring: a single ring can land
+  entirely on ornament or entirely between it, and either way the patch comes
+  out visibly lighter or darker than its field.
+- Custom art is **copied, not mutated** — `this.assets` is cached across
+  resizes and would otherwise accumulate a clearing every rebuild.
+- Costs two extra full-size canvas copies per door build. Only on
+  resize/selection, never per frame.
+
+---
+
 ## 2026-08-04 — Three unlock bugs ✅
 
 `src/spiralEngine.js`, `src/door3d.js`

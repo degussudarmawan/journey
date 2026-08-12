@@ -56,6 +56,23 @@ export const DOOR_ASSETS = {
 };
 
 /**
+ * WHERE THE KEYHOLE SITS, as a fraction of the door's height from the top.
+ * 0.5 is dead centre.
+ *
+ * This has to be tuned to YOUR artwork — put it in whatever clear band the
+ * ornament leaves, or the lock lands on top of the carving no matter how
+ * neatly the two are drawn. The code clears a small field around it, but it
+ * can't invent space that the design doesn't have.
+ *
+ * Currently 0.4: the gap between the top strap and the middle scrollwork in
+ * the door art in public/door/. Move the ornament and you move this.
+ *
+ * Everything follows it — the plate, the bore, the cleared field, and the
+ * point the key flies to.
+ */
+export const DOOR_LOCK_Y = 0.4;
+
+/**
  * Relief depth. Raise it if your carving looks too shallow, lower it if the
  * lighting looks noisy or plasticky. Only affects the height map.
  */

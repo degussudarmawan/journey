@@ -25,8 +25,26 @@
 
 import * as THREE from "three";
 import { buildKeyMesh } from "./key3d";
+import { buildLock, lockMetrics } from "./lock3d";
+import { LEAF_DEPTH_FRAC } from "./door3d";
 
 const MAX_DOTS = 24000; // ~1.6k particles x 4 halftone sub-dots, with headroom
+
+/** A stand-in "room" for the metal to reflect. Matches door3d's exactly. */
+function envCanvas() {
+  const c = document.createElement("canvas");
+  c.width = 256;
+  c.height = 128;
+  const ctx = c.getContext("2d");
+  const g = ctx.createLinearGradient(0, 0, 0, 128);
+  g.addColorStop(0, "#ffffff");
+  g.addColorStop(0.46, "#ccd0e0");
+  g.addColorStop(0.54, "#6e7284");
+  g.addColorStop(1, "#262830");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 256, 128);
+  return c;
+}
 
 /**
  * CSS colour -> linear RGB, via a 1x1 canvas.
@@ -187,16 +205,24 @@ export class DotsGL {
     this.points.frustumCulled = false;
     this.scene.add(this.points);
 
-    // Lights, because the key is a lit solid sharing this scene. The dots
-    // ignore them entirely — they're a ShaderMaterial with no lighting terms.
-    this.scene.add(
-      new THREE.AmbientLight(0xffffff, 0.75),
-      (() => {
-        const l = new THREE.DirectionalLight(0xfff4e6, 1.6);
-        l.position.set(-0.5, 0.9, 1);
-        return l;
-      })(),
-    );
+    // Lighting for the lit solids sharing this scene — the key and the lock.
+    // The dots ignore all of it: they're a ShaderMaterial with no lighting
+    // terms. These values deliberately match door3d's, so the plate here and
+    // the leaves on the canvas behind read as the same piece of ironmongery
+    // under the same light.
+    const envSrc = new THREE.CanvasTexture(envCanvas());
+    envSrc.mapping = THREE.EquirectangularReflectionMapping;
+    envSrc.colorSpace = THREE.SRGBColorSpace;
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    this.scene.environment = pmrem.fromEquirectangular(envSrc).texture;
+    envSrc.dispose();
+    pmrem.dispose();
+
+    const keyLight = new THREE.DirectionalLight(0xfff3e2, 2.1);
+    keyLight.position.set(-0.55, 0.8, 1);
+    const fill = new THREE.DirectionalLight(0x93a6ff, 0.55);
+    fill.position.set(0.9, -0.3, 0.6);
+    this.scene.add(keyLight, fill, new THREE.AmbientLight(0xffffff, 0.5));
 
     this.ok = true;
     return true;
@@ -212,34 +238,176 @@ export class DotsGL {
    * @param {{o: number[], x: number[], y: number[], z: number[]}} basis
    *   origin and axes from keyBasisForPiece()
    */
+  /**
+   * Builds (or rebuilds) the key mesh and the lock it enters.
+   *
+   * ONE key mesh serves the whole sequence — orbiting, flying, and seated in
+   * the lock. It used to exist twice, once per scene, and the two copies shaded
+   * differently as the animation crossed between them: the reflection visibly
+   * snapped. Both now live here, under one set of lights.
+   *
+   * The mesh hangs off two nested frames for the seated pose:
+   *   keyPivot — sits at the keyhole; TILTS the key to face into the door
+   *   keySpin  — rotates about the shaft: the actual turning of the key
+   * ...and is driven directly by a matrix for the orbit pose, where it has to
+   * follow an arbitrary needle frame rather than a tilt and a spin.
+   */
+  ensureLock(W, H, keyScale, keyDef) {
+    // Must match the door's leaf thickness: the plate stands off that surface.
+    const leafDepth = Math.max(6, H * LEAF_DEPTH_FRAC);
+    if (!this.ok || !keyDef) return;
+    const sig = `${W}x${H}:${keyDef.id}:${Math.round(keyScale * 100)}`;
+    if (this._lockSig === sig) return;
+    this._lockSig = sig;
+    this._teardownLock();
+
+    const m = lockMetrics(keyDef, keyScale, W, H);
+    this.lock = buildLock(m, leafDepth);
+    this.scene.add(this.lock.group);
+
+    this.key = buildKeyMesh(keyDef);
+    for (const mat of this.key.materials) {
+      mat.depthTest = true;
+      mat.depthWrite = true;
+    }
+    // Both are transparent (they fade with the door), and three sorts the
+    // transparent pass by centroid distance — which flips as the key tilts
+    // past the plate. Pinning the order stops that from deciding which is in
+    // front; the depth buffer still does the real occlusion.
+    this.lock.group.renderOrder = 1;
+    this.key.object.traverse((o) => {
+      o.renderOrder = 2;
+    });
+    this.keySpin = new THREE.Group();
+    this.keySpin.add(this.key.object);
+    this.keyPivot = new THREE.Group();
+    this.keyPivot.add(this.keySpin);
+    this.keyPivot.visible = false;
+    this.scene.add(this.keyPivot);
+
+    // Must clear the plate's FRONT face, bevel included — the extrusion runs
+    // from -bevelThickness to depth + bevelThickness, so "pd" alone is still
+    // buried inside it and the plate simply draws over the key.
+    this._keyZOut = leafDepth / 2 + m.pd * 1.3 + Math.max(5, m.pd * 0.6);
+    // Seated: the point in the hole sits just inside the plate's FRONT face,
+    // not at its mid-depth. The extrusion runs to 1.45 * pd once the bevel is
+    // counted, so a pivot at 0.5 * pd leaves a long stretch of shaft below the
+    // front surface — and since the key only climbs in z as it rises from the
+    // hole, that stretch is buried and the key reads as lying behind the lock
+    // rather than standing in it. Everything below the hole is still hidden,
+    // which is the part that should be.
+    this._keyZIn = leafDepth / 2 + m.pd * 1.15;
+    this._lockY = m.lockY;
+  }
+
+  /**
+   * How far in front of the door the key rests before it enters, in three's
+   * z. The flight has to end here, not at z = 0 — the plate stands proud of
+   * the door surface, so a key arriving at the door's own plane arrives
+   * BEHIND the lock and is occluded for the whole late approach.
+   */
+  keyRestZ() {
+    return this._keyZOut ?? 0;
+  }
+
+  /** Hides the key. */
+  hideKey() {
+    if (this.keyPivot) this.keyPivot.visible = false;
+  }
+
+  /** Sets the lock's opacity — it fades out with the door as the leaves part. */
+  setLockAlpha(a) {
+    if (!this.lock) return;
+    this.lock.group.visible = a > 0.01;
+    for (const m of this.lock.materials) m.opacity = a;
+  }
+
+  /**
+   * Poses the key from an arbitrary basis — riding a needle, or mid-flight.
+   * @param {{o: number[], x: number[], y: number[], z: number[]}} basis
+   */
   setKey(keyDef, basis, alpha) {
-    if (!this.ok) return;
-    if (!keyDef || alpha <= 0.004) {
-      if (this.keyObj) this.keyObj.visible = false;
+    if (!this.ok || !this.keyPivot || alpha <= 0.004) {
+      this.hideKey();
       return;
     }
-    if (this._keyId !== keyDef.id) {
-      if (this.key) {
-        this.scene.remove(this.keyObj);
-        this.key.dispose();
-      }
-      this.key = buildKeyMesh(keyDef);
-      this.keyObj = this.key.object;
-      // Depth-tested against the dots, and writing depth so they're hidden
-      // behind it in turn.
-      for (const m of this.key.materials) {
-        m.depthTest = true;
-        m.depthWrite = true;
-      }
-      this.scene.add(this.keyObj);
-      this._keyId = keyDef.id;
-    }
-    this.keyObj.visible = true;
-    this.keyObj.matrixAutoUpdate = false;
+    this.keyPivot.visible = true;
+    this._resetKeyFrames();
+    this.key.object.matrixAutoUpdate = false;
     const V = (a) => new THREE.Vector3(a[0], a[1], a[2]);
-    this.keyObj.matrix.makeBasis(V(basis.x), V(basis.y), V(basis.z));
-    this.keyObj.matrix.setPosition(V(basis.o));
+    this.key.object.matrix.makeBasis(V(basis.x), V(basis.y), V(basis.z));
+    this.key.object.matrix.setPosition(V(basis.o));
     for (const m of this.key.materials) m.opacity = alpha;
+  }
+
+  /**
+   * Poses the key seated in the lock: pitched into the door, slid along its
+   * shaft, turning. Everything is in the key's own authored units (total
+   * height 2.4); `scale` converts to screen pixels.
+   */
+  setKeySeated(s) {
+    if (!this.ok || !this.keyPivot || s.alpha <= 0.004) {
+      this.hideKey();
+      return;
+    }
+    this.keyPivot.visible = true;
+    this._resetKeyFrames();
+    this.key.object.matrixAutoUpdate = true;
+    // Offset by the SHAFT AXIS, not the key's centre: the bow and scrolls hang
+    // to one side, so centring the bounding box stands the key in crooked.
+    this.key.object.position.set(-s.pivotX, s.pivotY, 0);
+    this.keyPivot.scale.setScalar(s.scale);
+    this.keyPivot.position.set(
+      0,
+      this._lockY,
+      this._keyZOut + (this._keyZIn - this._keyZOut) * s.insert,
+    );
+    // Pitching about X swings the bit away from the viewer and into the door,
+    // leaving the bow out front. It stops short of a right angle on purpose:
+    // a key aimed exactly down the view axis projects to a bare line, its
+    // whole length collapsing to nothing.
+    this.keyPivot.rotation.set(s.tilt, 0, 0);
+    // Turning happens about the shaft, so it stays a real turn at any tilt.
+    this.keySpin.rotation.set(0, s.turn, 0);
+    for (const m of this.key.materials) m.opacity = s.alpha;
+  }
+
+  /**
+   * Clears every frame back to identity before a pose is applied.
+   *
+   * The two posing modes drive DIFFERENT properties — the basis writes a
+   * matrix on the object, the seated pose writes scale and rotations on the
+   * pivots — so whatever one set stays set when the other takes over. The
+   * scale was the dangerous one: seated leaves `keyPivot.scale` at ~100, and
+   * the next basis pose multiplies its own scale by that again, which is a
+   * key a hundred times too big. Resetting everything first makes the modes
+   * independent instead of merely ordered.
+   */
+  _resetKeyFrames() {
+    this.keyPivot.position.set(0, 0, 0);
+    this.keyPivot.rotation.set(0, 0, 0);
+    this.keyPivot.scale.setScalar(1);
+    this.keySpin.position.set(0, 0, 0);
+    this.keySpin.rotation.set(0, 0, 0);
+    this.keySpin.scale.setScalar(1);
+    this.key.object.position.set(0, 0, 0);
+    this.key.object.rotation.set(0, 0, 0);
+    this.key.object.scale.setScalar(1);
+  }
+
+  _teardownLock() {
+    if (this.lock) {
+      this.scene.remove(this.lock.group);
+      this.lock.dispose();
+      this.lock = null;
+    }
+    if (this.keyPivot) {
+      this.scene.remove(this.keyPivot);
+      this.key.dispose();
+      this.key = null;
+      this.keyPivot = null;
+      this.keySpin = null;
+    }
   }
 
   /**
@@ -331,7 +499,7 @@ export class DotsGL {
   }
 
   unmount() {
-    this.key?.dispose();
+    this._teardownLock();
     this.geometry?.dispose();
     this.material?.dispose();
     this.renderer?.dispose();

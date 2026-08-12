@@ -66,6 +66,7 @@
 import { keyForSpike } from "./keys";
 import { drawKey3D, sampleKeyLocalPoints } from "./keyRenderer";
 import { buildDoorArt, drawDoor } from "./door";
+import { DOOR_LOCK_Y } from "./doorAssets";
 
 export const DEFAULT_PALETTE = ["#c98a8a", "#8aa8c9", "#8ec9a6", "#b98ac9"];
 
@@ -730,7 +731,7 @@ export class SpiralEngine {
   U_INSERT = [0.52, 0.63]; // key seats into the hole
   U_TURN = [0.63, 0.79]; // key rotates — the actual unlocking
   U_SWING = [0.79, 1.0]; // door opens
-  KEY_DOOR_SCALE = 0.32; // key height at the door, as a fraction of min(w,h)
+  KEY_DOOR_SCALE = 0.26; // key height at the door, as a fraction of min(w,h)
   KEY_PIVOT_Y = 0.72; // point along the key (local units) that enters the hole
   // How far the key rotates to unlock. The turn is about the SHAFT, so the
   // key's flat face swings toward edge-on and it narrows as it goes — near a
@@ -1283,6 +1284,8 @@ export class SpiralEngine {
         this.selectedKey,
         this.keyDoorScale(),
       );
+      // The lock and the key belong to the dots scene, not the door's.
+      this.dotsGL?.ensureLock(w, h, this.keyDoorScale(), this.selectedKey);
       return;
     }
     if (this.doorArt && this.doorArt.W === w && this.doorArt.H === h) return;
@@ -1333,18 +1336,33 @@ export class SpiralEngine {
     // at the keyhole rather than the stem.
     const pivot = this.keyPivotNow(u);
     const pivotX = this.selectedKey?.lock?.pivotX ?? 0;
+    // The keyhole is not necessarily at screen centre — DOOR_LOCK_Y puts it
+    // wherever the door art leaves a clear band. Without this the key flies
+    // to the middle of the screen and the lock is somewhere else.
+    const lockY = (DOOR_LOCK_Y - 0.5) * h;
+    // Land in FRONT of the lock plate, not on the door's own plane. The plate
+    // stands proud of the surface, so ending at z = 0 puts the key behind it
+    // for the whole late approach and then snaps it forward at the handoff.
+    // Engine z runs away from the viewer; three's runs toward, hence negated.
+    const zFront = -(this.dotsGL?.keyRestZ() ?? 0);
     const o1 = [
       -endScale * (pivot * y1[0] + pivotX * x1[0]),
-      -endScale * (pivot * y1[1] + pivotX * x1[1]),
-      0,
+      -endScale * (pivot * y1[1] + pivotX * x1[1]) + lockY,
+      zFront,
     ];
 
     const t = this.phase(u, this.U_FLIGHT);
+    // Orientation leads the journey. Blending both at the same rate drags the
+    // key through edge-on around halfway, and a real solid seen edge-on is a
+    // sliver — the flat 2D key never had this problem because it always drew
+    // its full silhouette. Turning face-on in the first half of the flight
+    // keeps it readable for the part anyone actually watches.
+    const tA = this.clamp(t * 1.9, 0, 1);
     const mix3 = (a, b) => {
       const v = [
-        this.lerp(a[0], b[0], t),
-        this.lerp(a[1], b[1], t),
-        this.lerp(a[2], b[2], t),
+        this.lerp(a[0], b[0], tA),
+        this.lerp(a[1], b[1], tA),
+        this.lerp(a[2], b[2], tA),
       ];
       const l = Math.hypot(v[0], v[1], v[2]) || 1;
       return [v[0] / l, v[1] / l, v[2] / l];
@@ -1745,7 +1763,7 @@ export class SpiralEngine {
       // The GL key is a persistent object in a scene, not marks on a canvas
       // that gets cleared every frame, so leaving the stage that draws it is
       // not enough to make it go away. It has to be dismissed.
-      this.dotsGL?.setKey(null);
+      this.dotsGL?.hideKey();
     }
     this.updateView();
 
@@ -1823,16 +1841,9 @@ export class SpiralEngine {
             this.U_FLIGHT[1],
             u,
           );
-          this.door3d.setKey({
-            show: this._keyHandoff > 0,
-            scale: this.keyDoorScale(),
-            pivotX: this.selectedKey?.lock?.pivotX ?? 0,
-            pivotY: this.keyPivotNow(u),
-            insert: this.phase(u, this.U_INSERT),
-            tilt: this.phase(u, this.U_INSERT) * this.KEY_INSERT_TILT,
-            turn: this.phase(u, this.U_TURN) * this.KEY_TURN_ANGLE,
-            alpha: this._keyHandoff * (1 - swing),
-          });
+          // The lock lives in the dots scene now (see lock3d.js), so it fades
+          // with the door rather than being part of it.
+          this.dotsGL?.setLockAlpha(doorIn * (1 - swing));
         } else if (this.doorArt) {
           ctx.save();
           ctx.globalAlpha = doorIn;
@@ -1924,14 +1935,28 @@ export class SpiralEngine {
         // handled here; once the unlock starts the key belongs to the door's
         // scene, which owns the flight and the keyhole.
         if (this.dotsGL) {
-          if (chosen && keyAlpha > 0.004) {
-            // Riding the ring, or flying the unlock path — same mesh either
-            // way, just a different frame. Once _keyHandoff completes the
-            // door's scene takes the key over, and keyAlpha has already
-            // faded this copy out.
-            const basis =
-              u > 0 ? this.keyUnlockBasis(f, u) : this.keyBasisForPiece(f);
-            this.dotsGL.setKey(this.selectedKey, basis, keyAlpha);
+          if (chosen) {
+            // ONE mesh for the whole sequence — riding the ring, flying the
+            // unlock path, and seated in the lock. Only the pose changes.
+            // It used to be two meshes in two scenes, and they shaded
+            // differently as the animation crossed between them, which read
+            // as the key's reflection snapping.
+            const alpha = keyFade * (1 - this.phase(u, this.U_SWING));
+            if (this._keyHandoff >= 1) {
+              this.dotsGL.setKeySeated({
+                scale: this.keyDoorScale(),
+                pivotX: this.selectedKey?.lock?.pivotX ?? 0,
+                pivotY: this.keyPivotNow(u),
+                insert: this.phase(u, this.U_INSERT),
+                tilt: this.phase(u, this.U_INSERT) * this.KEY_INSERT_TILT,
+                turn: this.phase(u, this.U_TURN) * this.KEY_TURN_ANGLE,
+                alpha,
+              });
+            } else {
+              const basis =
+                u > 0 ? this.keyUnlockBasis(f, u) : this.keyBasisForPiece(f);
+              this.dotsGL.setKey(this.selectedKey, basis, alpha);
+            }
             this._glKeyShown = true;
           }
           return;
@@ -1981,7 +2006,8 @@ export class SpiralEngine {
       if (!residueDrawn) drawResidue();
       // Nothing claimed the key this frame — deselected, or handed to the
       // door. The mesh persists between frames, so it has to be told.
-      if (this.dotsGL && !this._glKeyShown) this.dotsGL.setKey(null);
+      if (this.dotsGL && !this._glKeyShown) this.dotsGL.hideKey();
+      if (this.dotsGL && u <= 0) this.dotsGL.setLockAlpha(0);
 
       // The door has finished swinging: hand off to whatever shows the page.
       if (u >= 1 && !this._unlockFired) {

@@ -496,12 +496,25 @@ export class DotsGL {
     if (!this.ok || this.count >= MAX_DOTS) return;
     const i = this.count++;
     const f = this.focal;
-    const scale = f / Math.max(f * 0.25, f + depth); // mirrors orbitPersp()
+    // CLAMP THE DEPTH, NOT THE SCALE.
+    //
+    // orbitPersp() floors its denominator so a piece swinging near the camera
+    // can't divide by nothing and explode. Mirroring that as a clamp on the
+    // SCALE alone breaks the round trip: this unprojects using the clamped
+    // scale, then the GPU re-projects using the true depth, and the moment the
+    // clamp bites the two disagree — violently, because that is exactly where
+    // the true scale is running away. The dot jumps somewhere else entirely,
+    // which is what made near needles teleport as they came past the eye.
+    //
+    // Clamping the depth to the point where the floor would have engaged keeps
+    // one number describing the dot, so unproject and project stay inverses.
+    const dz = Math.max(depth, -f * 0.75);
+    const scale = f / (f + dz);
     this.pos[i * 3] = (x - this.cx - (this.pan?.x || 0)) / scale;
     // Screen y runs down, three's world y runs up.
     this.pos[i * 3 + 1] = -(y - this.cy - (this.pan?.y || 0)) / scale;
     // ...and the engine's +z is away from the viewer, three's is toward.
-    this.pos[i * 3 + 2] = -depth;
+    this.pos[i * 3 + 2] = -dz; // the clamped depth, so this inverts `scale`
     const c = this.colors.get(css);
     this.tint[i * 3] = c[0];
     this.tint[i * 3 + 1] = c[1];

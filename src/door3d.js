@@ -156,59 +156,16 @@ function heightToSpec(src) {
   return out;
 }
 
-// ---- lock geometry ---------------------------------------------------------
-//
-// Both shapes are built with the ORIGIN AT THE KEYHOLE rather than at the
-// plate's centre. The keyhole is the one point everything else has to agree
-// about — the key aims for it, the key pivots about it, and the clipping
-// plane passes through it — so making it the origin removes an offset from
-// every one of those calculations instead of repeating it in each.
-
-/**
- * The lock plate: a shield with the keyhole cut clean through it.
- *
- * The hole is the whole point — without it the plate is a solid slab and the
- * key has nowhere to go, so it ends up perched on the front looking pasted on.
- */
-function escutcheonShape(pw, ph, hole) {
-  const s = new THREE.Shape();
-  const top = ph * 0.39;
-  const bot = -ph * 0.55;
-  s.moveTo(0, top);
-  s.bezierCurveTo(pw * 0.45, ph * 0.3, pw * 0.38, -ph * 0.22, 0, bot);
-  s.bezierCurveTo(-pw * 0.38, -ph * 0.22, -pw * 0.45, ph * 0.3, 0, top);
-  s.holes.push(keyholeShape(hole));
-  return s;
-}
-
-/**
- * The keyhole itself: a bore with a tapered ward slot hanging below it.
- *
- * Proportioned so the slot is about as wide as the KEY'S SHAFT. A keyhole
- * sized for looks alone ends up narrower than the key that has to pass
- * through it, and then the key visibly doesn't fit its own lock.
- */
-function keyholeShape(hole) {
-  const { r, halfTop, halfBot, yBot } = hole;
-  // Meet the circle exactly where the slot's sides cross it, so the two
-  // merge into one silhouette instead of reading as a disc with a tab.
-  const yJoin = -Math.sqrt(Math.max(0, r * r - halfTop * halfTop));
-  const aRight = Math.atan2(yJoin, halfTop);
-  const s = new THREE.Shape();
-  s.absarc(0, 0, r, aRight, Math.PI * 2 + Math.atan2(yJoin, -halfTop), false);
-  s.lineTo(-halfBot, yBot);
-  s.lineTo(halfBot, yBot);
-  s.closePath();
-  return s;
-}
-
 /**
  * A stand-in "room" for metal to reflect: bright above, dark below, with a
  * horizon. Metalness in a physically-based renderer means "show me your
  * surroundings instead of a diffuse colour" — so a metal lit only by direct
  * lights, with no environment, renders very nearly BLACK. That isn't a bug in
- * the lighting, it's the whole point of the model. This is the cheapest
- * possible fix: 256x128 pixels of gradient, prefiltered once at startup.
+ * the lighting, it's the whole point of the model.
+ *
+ * Kept byte-identical to dotsGL's copy: the key crosses between the two
+ * scenes mid-animation, and any difference in what they reflect shows up as
+ * its surface visibly changing partway through.
  */
 function envCanvas() {
   const c = makeCanvas(256, 128);

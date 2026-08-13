@@ -11,7 +11,7 @@ export default function App() {
       word3="more"
       word4=">.<"
       rotationSpeed={0.16}
-      accentPalette={['#000000']}
+      accentPalette={['#f1f10e']}
       // accentPalette={['#c98a8a', '#8aa8c9', '#8ec9a6', '#b98ac9']}
       raySway={0.14}
       cursorRepel={1}

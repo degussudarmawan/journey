@@ -152,7 +152,7 @@ export default function Spiral({
       style={{
         position: "relative",
         width: "100%",
-        background: "oklch(98.5% 0.003 260)",
+        // background: "oklch(98.5% 0.003 260)",
       }}
     >
       <div ref={trackRef} style={{ height: `${trackHeightVh}vh`, position: "relative" }}>

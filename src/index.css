@@ -1,7 +1,18 @@
-html, body, #root {
+html,
+body,
+#root {
   margin: 0;
   padding: 0;
-  background: oklch(98.5% 0.003 260);
+  /* background: oklch(98.5% 0.003 260); */
+  /* background: #101212; */
+  /* background: #020024; */
+  background: #020024;
+  background: radial-gradient(
+    circle,
+    rgba(2, 0, 36, 1) 0%,
+    rgba(9, 9, 121, 1) 79%,
+    rgba(5, 94, 177, 1) 100%
+  );
 }
 
 * {

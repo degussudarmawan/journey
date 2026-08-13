@@ -75,7 +75,9 @@ export class SpiralEngine {
   // ---- Palette --------------------------------------------------------------
   // INK is the "settled" colour: dots fade toward it as the star forms, and
   // ~40% of particles (colorSlot === -1) are always drawn in it.
-  INK = "#2a2a2f";
+  // INK = "#dfe0e2";
+  INK = "#f1f10e"; // bright yellow
+  // INK = "#2a2a2f";
 
   // ---- Eight-point starburst tuning ------------------------------------------
   STAR_VALLEY = 0.2; // valley radius, as a fraction of R
@@ -86,6 +88,61 @@ export class SpiralEngine {
   // See buildGrid() (where these are rolled per-particle) and loop()'s
   // spiral position calc (where they're applied) for how these combine.
   ORBIT_SPREAD = 0.35; // +/- fraction of ROT_SPEED each particle's own orbit rate can vary by (0 = rigid pinwheel)
+  // ---- Spiral shape ----
+  // The spiral reads as a funnel seen down its axis rather than a flat
+  // pinwheel: dots swell toward the rim and shrink to grit at the core, so
+  // size alone carries the depth. Nothing here moves anything in z — it's
+  // purely that the eye reads "smaller and denser" as "further away".
+  // Outer radius, against the SHORT edge. Measuring it against the diagonal
+  // seemed like the way to "fill the screen" and is actually the opposite:
+  // the rim lands past the corners, so the whole outer half of the funnel —
+  // the big dots, the part carrying the depth — sits off-screen, and all you
+  // see is the small, sparse core. Just over half the short edge bleeds top
+  // and bottom while keeping the rim in view.
+  // Against the DIAGONAL, so the arms carry past the corners and the spiral
+  // genuinely covers the frame instead of sitting as a disc inside it.
+  //
+  // Reaching past the edge is only a problem if the SIZE ramp is keyed to the
+  // full radius — then its top end lands off-screen and all you ever see is
+  // the small, flat inner part. It's keyed to the visible radius instead (see
+  // buildGrid), so the whole grit-to-boulder range plays out within the frame
+  // and the extent beyond it is just more rim.
+  SPIRAL_FILL = 0.56;
+  // The funnel is REAL geometry now, not a pair of hand-tuned ramps: each
+  // particle sits at a genuine z and the same perspective divide the orbit
+  // uses does the shrinking. Size and inward pull then come from one number
+  // instead of two that have to be kept agreeing — which is what they kept
+  // failing to do.
+  // Depth reads from CONTRAST, not from being technically correct. With the
+  // throat only a few focal lengths back, near and far dots differ by maybe
+  // 5x — measurable, but both still read as "a small dot", so the funnel goes
+  // vague. Pushing the throat further and making the near dots genuinely
+  // chunky is what turns a gradient into a plunge.
+  SPIRAL_DEPTH = 2000; // how far the throat lies behind the screen plane, px
+  SPIRAL_Z_CURVE = 1.6; // >1 keeps the outer arms shallow and plunges late
+  SPIRAL_DOT_BASE = 3.1; // one dot radius, AT THE PLANE; perspective grades it
+  // Atmospheric perspective: the second half of the depth cue. Size alone says
+  // "smaller", which the eye can just as easily read as "small". Size AND a
+  // wash toward the background says "further" — haze is the thing distance
+  // actually does to a real object, and it's what stops the core reading as a
+  // patch of fine grit and starts it reading as a long way down.
+  SPIRAL_FADE_INNER = 0.1; // opacity at the very centre — hazy, still there
+  // The haze runs on RADIUS, not on z. Size has to follow real depth or the
+  // funnel stops being real — but z is deliberately curved (shallow arms, late
+  // plunge), so a haze keyed to it barely moves across the outer half and
+  // dumps its whole range into the core. That reads as a dim patch in the
+  // middle rather than a field receding. Radius spreads the same amount of
+  // fade evenly over everything on screen.
+  SPIRAL_FADE_CURVE = 0.85; // <1 biases a little more fade into the mid-field
+  // ---- Comet trails ----
+  // Each dot is followed by a few samples of where it actually was, so the
+  // tail's length is its real speed rather than a decoration: outer dots
+  // sweep a bigger circle in the same time and streak further, inner ones
+  // barely smear, and a dot at rest has no tail at all.
+  TRAIL_STEPS = 5; // samples per dot — the cost multiplier on the whole field
+  TRAIL_SECS = 0.16; // how far back in time the tail reaches
+  TRAIL_STRENGTH = 0.55; // opacity of the tail relative to its head
+  TRAIL_TAPER = 0.35; // size of the oldest sample relative to the head
   DRIFT_R_MIN = 1.5; // smallest per-particle local wobble radius, in px
   DRIFT_R_MAX = 5; // largest per-particle local wobble radius, in px
   DRIFT_SPEED_MIN = 0.5; // slowest per-particle local wobble speed, rad/s
@@ -221,6 +278,11 @@ export class SpiralEngine {
   // just picks different (x,y) for the same particle index.
   buildGrid() {
     const { w, h } = this.dims;
+    // One pool of particles serves EVERY stage, so raising the count for one
+    // of them raises it for all. Densifying this to fill out the enlarged
+    // spiral packed the starburst past the point where its eight points read
+    // at all — it collapsed into a blob. The spiral gets its depth from dot
+    // size and haze instead, which costs nothing anywhere else.
     const spacing = this.clamp(Math.round(w / 46), 20, 32); // grid pitch in px — smaller divisor = denser grid
     const dotR = spacing * 0.16;
     const cols = Math.ceil(w / spacing) + 3;
@@ -249,7 +311,7 @@ export class SpiralEngine {
       const d = Math.hypot(p.gx - cx, p.gy - cy);
       if (d > maxDist) maxDist = d;
     });
-    const maxRadius = Math.min(w, h) * 0.4; // spiral's outer radius
+    const maxRadius = Math.hypot(w, h) * this.SPIRAL_FILL;
     const TURNS = 8; // how many times the spiral winds around
     particles.forEach((p, i) => {
       p.seed = this.hash(i * 3.77);
@@ -263,9 +325,39 @@ export class SpiralEngine {
       const f = i / N;
       p.spiralAngle0 =
         f * TURNS * Math.PI * 2 + (this.hash(i * 21.7) - 0.5) * 0.3;
+      // sqrt spacing = even area density, so the arms don't bunch at the core
+      const radial = Math.sqrt(f); // 0 at the centre, 1 at the rim
       p.spiralRadius =
-        maxRadius * Math.sqrt(f) +
-        (this.hash(i * 27.9) - 0.5) * maxRadius * 0.03; // sqrt spacing = even area density
+        maxRadius * radial + (this.hash(i * 27.9) - 0.5) * maxRadius * 0.03;
+      // Size by radius: big rocks at the rim, grit at the core. This is the
+      // whole depth cue, so it gets its own radius rather than reusing dustR —
+      // dustR also draws the WORDS, where position has nothing to do with
+      // spiral radius and a 10x size spread would just look lumpy.
+      // Both ramps run on `radial` — the fraction of the spiral's FULL extent,
+      // not of the visible area. Dividing by the visible radius instead makes
+      // the ramp saturate at the screen edge, so everything beyond it pins to
+      // the maximum: a broad band of identical dots filling the outer frame,
+      // with the whole gradient crushed into the middle.
+      // How far behind the screen plane this particle sits. The rim is at the
+      // plane and the throat is SPIRAL_DEPTH back, so the arm is a real funnel
+      // running away from the viewer — not a flat disc drawn to look like one.
+      // ^SPIRAL_Z_CURVE >1 keeps the outer arms near the plane and drops the
+      // last stretch away steeply, which is what gives the throat its plunge.
+      p.spiralZ = this.SPIRAL_DEPTH * Math.pow(1 - radial, this.SPIRAL_Z_CURVE);
+      // ONE size for every particle. The size gradient is no longer authored —
+      // the perspective divide produces it, correctly, from the z above.
+      // No per-particle size randomness. Depth alone decides how big a dot is,
+      // so the field reads as one receding surface; jitter on top of that just
+      // scatters oversized dark specks through it that look like noise rather
+      // than distance.
+      p.spiralDotR = this.SPIRAL_DOT_BASE;
+      // Haze, keyed to radius so it grades across the whole field rather than
+      // collapsing into the core the way a z-keyed fade does.
+      p.spiralFade = this.lerp(
+        this.SPIRAL_FADE_INNER,
+        1,
+        Math.pow(radial, this.SPIRAL_FADE_CURVE),
+      );
       // Galaxy-style motion (used in loop()'s spiral position calc): every
       // particle orbits at its own rate rather than sharing one rigid
       // rotation speed (ORBIT_SPREAD), like differential rotation — the
@@ -300,7 +392,7 @@ export class SpiralEngine {
     const ctx = off.getContext("2d");
     ctx.scale(scale, scale);
     ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = "#000";
+    // ctx.fillStyle = "#000";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     let fontSize = h * 0.6;
@@ -687,10 +779,18 @@ export class SpiralEngine {
   // Listed in detach order: starts with the long bottom ray, then sweeps
   // around the circle. Drop entries here to keep those spikes on the star.
   ORBIT_SPIKES = [5, 6, 7, 0, 1, 2, 3, 4];
-  ORBIT_TILT_DEG = 62; // 0 = flat circle facing the viewer, 90 = fully edge-on
+  ORBIT_TILT_DEG = 100; // 0 = flat circle facing the viewer, 90 = fully edge-on
   ORBIT_SPEED = 0.32; // orbital angular speed, rad/s
   ORBIT_RADIUS_FRAC = 0.3; // orbit radius, as a fraction of min(w,h)
-  ORBIT_FOCAL = 520; // perspective focal length in px — smaller = stronger depth
+  // Perspective focal length in px — smaller = stronger depth. Also how far
+  // the camera stands from the ring, and that's the binding constraint: at
+  // 520 the nearest needles came close enough that `orbitPersp` hit its
+  // divide-by-nothing floor, and a clamped projection can't stay continuous
+  // through the point where it engages — the piece jumped as it passed the
+  // eye. Standing further back keeps every piece well clear of the floor, so
+  // the projection is smooth all the way round. Costs some depth punch; a
+  // ring that visibly teleports costs more.
+  ORBIT_FOCAL = 1200;
   ORBIT_UNDULATE = 0.15; // vertical rise/fall of the track, as a fraction of radius
   // Which point along a spike rides the track (0 = base, 1 = tip). 0.5 centres
   // each needle on the ring; because the pieces stand upright, a low value
@@ -1320,11 +1420,7 @@ export class SpiralEngine {
     // Start: the key riding its piece, expressed as an origin plus three axes.
     const startScale = (len / 2.4) * this.KEY_FIT;
     const la = len / 2 - f.slot.anchorAlong;
-    const o0 = [
-      f.px + la * f.ax,
-      f.py + la * f.ay,
-      f.pz + la * f.az,
-    ];
+    const o0 = [f.px + la * f.ax, f.py + la * f.ay, f.pz + la * f.az];
     const x0 = [f.cx, f.cy, f.cz];
     const y0 = [-f.ax, -f.ay, -f.az]; // key y is down; needle `along` runs out
     const z0 = [f.ux, f.uy, f.uz];
@@ -1788,7 +1884,11 @@ export class SpiralEngine {
     if (inOrbit && this.orbitGroups) {
       // Debug mode picks the first spike that actually has a key, so the
       // frozen frame has something to show.
-      if (this._debugU !== null && this.selectedSlot == null && this.orbitSlots) {
+      if (
+        this._debugU !== null &&
+        this.selectedSlot == null &&
+        this.orbitSlots
+      ) {
         const k = this.orbitSlots.findIndex((sl) => keyForSpike(sl.spikeIdx));
         if (k >= 0) {
           this.selectPiece(k, elapsed);
@@ -2112,52 +2212,127 @@ export class SpiralEngine {
       // rotation, like a galaxy, instead of one rigid pinwheel), and the
       // drift term loops each particle around a tiny point of its own so
       // the swarm reads as many independently-moving dots, not one shape.
+      // Where this particle's spiral position WAS at time t. Positions here
+      // are analytic — a function of elapsed, not an accumulated state — so
+      // the past is as cheap to evaluate as the present. That's what makes
+      // the comet trail exact rather than a smear: each tail sample is a real
+      // former position, so the tail is as long as the dot is fast and
+      // vanishes entirely when it stops. No stored history, no trail buffer,
+      // and nothing to go stale when a stage changes.
+      const spiralAt = (t) => {
+        const ang = p.spiralAngle0 + t * ROT_SPEED * p.orbitRateMul;
+        const dAng = t * p.driftSpeed + p.driftPhase;
+        return [
+          p.spiralRadius * Math.cos(ang) + Math.cos(dAng) * p.driftR,
+          p.spiralRadius * Math.sin(ang) + Math.sin(dAng) * p.driftR,
+        ];
+      };
       const angleNow = p.spiralAngle0 + elapsed * ROT_SPEED * p.orbitRateMul;
       const driftAngle = elapsed * p.driftSpeed + p.driftPhase;
-      const sx =
-        cx + p.spiralRadius * Math.cos(angleNow) + Math.cos(driftAngle) * p.driftR;
-      const sy =
-        cy + p.spiralRadius * Math.sin(angleNow) + Math.sin(driftAngle) * p.driftR;
-      let x, y, r;
+      // The spiral's position in WORLD space, relative to the centre and
+      // before any perspective. It has to stay unprojected here because the
+      // divide depends on how far into the funnel this stage is.
+      const wx =
+        p.spiralRadius * Math.cos(angleNow) + Math.cos(driftAngle) * p.driftR;
+      const wy =
+        p.spiralRadius * Math.sin(angleNow) + Math.sin(driftAngle) * p.driftR;
+
+      // Every stage is the same shape: a FLAT target (grid, or word) and a
+      // number saying how far this stage has travelled into the funnel. `m`
+      // is that number — 0 is flat on the screen plane, 1 is the full depth.
+      // Collapsing six near-identical branches to one is what makes the
+      // depth real rather than painted: position, size and haze all fall out
+      // of the same projection instead of each being tuned by hand.
+      let m, fx, fy, fr;
       if (stage.kind === "static") {
         const bob = Math.sin(elapsed * 0.8 + p.seed * 6.28) * 1.3;
-        x = p.gx;
-        y = p.gy + bob;
-        r = p.dotR;
+        m = 0;
+        fx = p.gx;
+        fy = p.gy + bob;
+        fr = p.dotR;
       } else if (stage.kind === "explode") {
-        const localMix = this.clamp(stage.mix * 1.9 - p.delayFrac * 0.9, 0, 1); // outer particles lag behind
-        x = this.lerp(p.gx, sx, localMix);
-        y = this.lerp(p.gy, sy, localMix);
-        r = this.lerp(p.dotR, p.dustR, localMix);
+        m = this.clamp(stage.mix * 1.9 - p.delayFrac * 0.9, 0, 1); // outer particles lag behind
+        fx = p.gx;
+        fy = p.gy;
+        fr = p.dotR;
       } else if (stage.kind === "toWord") {
         const lp = this.wordPointsFor(stage.word, i, elapsed);
-        x = this.lerp(sx, lp.x, stage.mix);
-        y = this.lerp(sy, lp.y, stage.mix);
-        r = p.dustR;
+        m = 1 - stage.mix;
+        fx = lp.x;
+        fy = lp.y;
+        fr = p.dustR;
       } else if (stage.kind === "hold") {
         const lp = this.wordPointsFor(stage.word, i, elapsed);
-        x = lp.x;
-        y = lp.y;
-        r = p.dustR;
+        m = 0;
+        fx = lp.x;
+        fy = lp.y;
+        fr = p.dustR;
       } else if (stage.kind === "toSpiral") {
         const lp = this.wordPointsFor(stage.prevWord, i, elapsed);
-        x = this.lerp(lp.x, sx, stage.mix);
-        y = this.lerp(lp.y, sy, stage.mix);
-        r = p.dustR;
+        m = stage.mix;
+        fx = lp.x;
+        fy = lp.y;
+        fr = p.dustR;
       } else {
-        x = sx;
-        y = sy;
-        r = p.dustR;
+        m = 1;
+        fx = cx;
+        fy = cy;
+        fr = p.dustR;
       }
+
+      // REAL depth. The particle actually sits `z` behind the screen plane and
+      // the same perspective divide the orbit uses does the rest: dots at the
+      // throat come out smaller AND closer to the centre, because both their
+      // offset and their size shrink by the same factor. That coupling is what
+      // separates a funnel from a flat disc with small dots painted in the
+      // middle — no amount of tuning two independent ramps reproduces it.
+      const z = p.spiralZ * m;
+      const persp = this.orbitPersp(z);
+      const x = this.lerp(fx, cx + wx * persp, m);
+      const y = this.lerp(fy, cy + wy * persp, m);
+      const r = this.lerp(fr, p.spiralDotR * persp, m);
+      // Haze is the one cue perspective doesn't give you, so it stays
+      // authored — and keyed to radius rather than z, so it grades across the
+      // whole field instead of collapsing into the core.
+      const a = this.lerp(1, p.spiralFade, m);
+
       const fill = p.colorSlot === -1 ? this.INK : palette[p.colorSlot];
-      if (this.dotsGL) {
-        this.dotsGL.push(x, y, r, fill, 1);
-      } else {
-        ctx.beginPath();
-        ctx.fillStyle = fill;
-        ctx.arc(x, y, r, 0, Math.PI * 2);
-        ctx.fill();
+      // One emitter for the head and every tail sample, so the trail can't
+      // drift out of step with the dot it belongs to. Depth is shared too —
+      // the tail sits at the same z as its head, which keeps it inside the
+      // funnel instead of skating across the front of it.
+      const emit = (ex, ey, er, ea) => {
+        if (this.dotsGL) {
+          // Hand the GPU the real z as well, so the dot occupies that depth in
+          // the scene rather than being a flat sprite that merely looks small.
+          this.dotsGL.push(ex, ey, er, fill, ea, z);
+        } else {
+          ctx.globalAlpha = ea;
+          ctx.beginPath();
+          ctx.fillStyle = fill;
+          ctx.arc(ex, ey, er, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      };
+
+      // Tail first, so the head paints over its own trail rather than under
+      // it. Sampled backwards in time and blended toward the same flat target
+      // by `m`, which is what makes the trail shrink away as the dots settle
+      // into a word and disappear entirely once they're still.
+      if (m > 0.01 && this.TRAIL_STEPS > 0) {
+        const step = this.TRAIL_SECS / this.TRAIL_STEPS;
+        for (let k = this.TRAIL_STEPS; k >= 1; k--) {
+          const [twx, twy] = spiralAt(elapsed - k * step);
+          const back = 1 - k / (this.TRAIL_STEPS + 1); // 1 = nearest the head
+          emit(
+            this.lerp(fx, cx + twx * persp, m),
+            this.lerp(fy, cy + twy * persp, m),
+            r * this.lerp(this.TRAIL_TAPER, 1, back),
+            a * back * this.TRAIL_STRENGTH * m,
+          );
+        }
       }
+      emit(x, y, r, a);
     }
 
     this.finishFrame(false);

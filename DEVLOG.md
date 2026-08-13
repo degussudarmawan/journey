@@ -48,6 +48,189 @@ lock is built once and everything else asks it.
 
 ---
 
+## 2026-08-14 — Comet trails on the moving dots ✅
+
+`src/spiralEngine.js`
+
+Each dot now emits a few samples of where it actually was, drawn before its
+head so the head paints over its own tail.
+
+**Why sampling the past beats the usual approaches.** Positions here are
+*analytic* — a function of `elapsed`, not accumulated state — so evaluating
+where a dot was is exactly as cheap as where it is. That rules out the two
+things people normally reach for:
+
+- **No trail buffer.** The "skip the clear, wash the canvas with a translucent
+  fill" trick would smear the door and the key too, and fight the depth buffer.
+- **No stored history.** Nothing to go stale on a resize, a stage change, or a
+  scrub of the timeline.
+
+And because each sample is a *real former position*, the tail's length IS the
+dot's speed rather than a decoration on top of it. Outer dots sweep a far
+bigger circle in the same time and streak visibly; inner ones barely smear; a
+stationary dot has no tail at all — so trails vanish by themselves as the dots
+settle into a word, with no special-casing.
+
+`TRAIL_STEPS` 5, `TRAIL_SECS` 0.16, `TRAIL_STRENGTH` 0.55, `TRAIL_TAPER` 0.35.
+
+**Side effects**
+- **Point budget is now ~6x the particle count** (~8.5k of `MAX_DOTS` 24000).
+  Past roughly `TRAIL_STEPS = 15` it overflows and `push()` silently drops
+  dots — it returns early rather than growing the buffer.
+- Head and tail go through one `emit()` so they can't drift apart, and share
+  one `z` so the tail stays inside the funnel instead of skating across it.
+- Scoped to the spiral/word stages. The orbit's needles move too, but they're
+  thousands of halftone sub-dots — trails there are a budget question, not a
+  one-line change.
+
+---
+
+## 2026-08-14 — Haze spread across the field, not just the core ✅
+
+`src/spiralEngine.js`
+
+User: "the fade only works on the inner circle". Correct — the haze was keyed
+to `z`, and `SPIRAL_Z_CURVE = 1.6` deliberately keeps the outer arms shallow.
+So across the entire outer half opacity only moved 0.74 → 1.0, and the whole
+range dumped into the core: a dim patch in the middle rather than a field
+receding.
+
+Size still follows real depth — that's what makes the funnel a funnel — but
+**haze now runs on radius**, which spreads the same amount of fade evenly over
+everything on screen. It's the authored cue of the two, so it's the one free
+to be keyed to whatever reads best.
+
+Also removed the per-particle dot size jitter: with size now purely
+depth-driven, random variation on top just scatters oversized specks that read
+as noise rather than distance.
+
+**Side effects**
+- Dead constants deleted: `SPIRAL_DOT_INNER`, `SPIRAL_DOT_OUTER`,
+  `SPIRAL_DOT_CURVE`, `SPIRAL_DOT_JITTER`, `SPIRAL_FADE_OUTER`.
+- Size and haze are now driven by *different* inputs (z vs radius) on purpose.
+  That was a bug the last three times it happened by accident — the difference
+  is that one of them is physical and the other is a stylistic overlay.
+
+---
+
+## 2026-08-06 — The spiral's depth is real, not painted ✅
+
+`src/spiralEngine.js`
+
+User asked whether the funnel could be genuine 3D rather than an illusion. It
+can, and cheaply — the dots already render through a perspective camera; they
+were just being pushed at `depth = 0` with the depth hand-drawn on top.
+
+Each particle now has a true `spiralZ` (rim at the screen plane, throat
+`SPIRAL_DEPTH` behind it) and the same perspective divide the orbit uses does
+the rest. **Size and inward pull now come from one number**, so a particle at
+the throat is both smaller and closer to the centre by exactly the same factor.
+That coupling is what an illusion can't reproduce: a flat disc with small dots
+in the middle reads as small dots, while a funnel converges as it shrinks.
+
+Six near-identical stage branches collapsed into one. Each stage supplies a
+flat target (grid or word) and a number `m` for how far into the funnel it has
+travelled; position, size and haze all derive from that. The old branches each
+hand-tuned their own size and alpha crossfades — which is exactly how the size
+and the fade ended up on different ramps and disagreeing.
+
+Then tuned for contrast, because correct wasn't the same as legible: at ~5x
+between near and far dots both still read as "a small dot". `SPIRAL_DEPTH`
+3400 → 5200, `SPIRAL_DOT_BASE` 3.4 → 6.2, `SPIRAL_FADE_INNER` 0.42 → 0.22.
+
+**Side effects**
+- **Deleted** `SPIRAL_DOT_INNER` / `OUTER` / `CURVE` and `p.spiralFade`. One
+  dot size (`SPIRAL_DOT_BASE`) measured at the plane; perspective grades it.
+- Haze stays authored — perspective gives you no atmospheric falloff — but is
+  driven by true distance now rather than a stand-in for it.
+- `SPIRAL_FILL` no longer controls the funnel, only how wide the field is.
+  Depth is `SPIRAL_DEPTH` against `ORBIT_FOCAL`, so **changing the orbit's
+  focal length now also changes the spiral's depth**. They share one camera;
+  that's the price of it being one real space.
+- Earlier attempts keyed the ramps to `visRadius` (the largest fully-visible
+  radius). That clamps at the screen edge, pinning everything beyond it to
+  maximum size — a flat band filling the outer frame with the whole gradient
+  crushed into the middle. User caught it. Moot now, but worth not repeating.
+
+---
+
+## 2026-08-06 — Teleporting needles, and the spiral properly full-screen ✅
+
+`src/dotsGL.js`, `src/spiralEngine.js`, `src/door3d.js`
+
+**0. I broke the page.** A scripted range-deletion meant to remove the dead
+lock shapes from `door3d.js` also took `envCanvas()` with it. The build passed
+— an undefined free variable is a *runtime* ReferenceError, not a compile
+error — so nothing caught it until the whole component threw and the site went
+blank. Restored. Second time a scripted edit has caused a problem; targeted
+edits only.
+
+**1. Near needles teleported past the eye.** `orbitPersp()` floors its
+denominator so a piece swinging close to the camera can't divide by nothing.
+`dotsGL.push()` mirrored that as a clamp on the SCALE — which breaks the round
+trip, because it unprojects with the clamped scale and the GPU then
+re-projects with the true depth. The moment the clamp engages the two disagree,
+violently, since that's exactly where the true scale is running away. Now the
+DEPTH is clamped instead, so one number describes the dot and unproject and
+project stay inverses.
+
+**2. The spiral was small and flat again.** My previous "fix" traded the wrong
+thing away. The real constraint isn't the radius, it's that **the size ramp has
+to finish inside the frame**: keyed to the full radius, its top end lands
+off-screen and all you ever see is the small, flat inner part — which is why
+shrinking the radius made the gradient visible but killed the coverage, and
+growing it did the reverse.
+
+Radius is back on the diagonal (`SPIRAL_FILL = 0.56`) so the arms carry past
+the corners, and the size ramp is measured against `visRadius` — the largest
+radius still fully on screen — and clamps there. Full coverage AND the whole
+grit-to-boulder range visible, which were never actually in conflict.
+
+**Side effects**
+- Dots beyond `visRadius` are all at maximum size. Correct here (they're rim
+  either way) but it does mean `SPIRAL_FILL` no longer affects how big the
+  biggest dots are — only how far the field extends.
+
+---
+
+## 2026-08-06 — Spiral fills the screen, and dots size by radius ✅
+
+`src/spiralEngine.js`, `src/door3d.js`
+
+The spiral was a small disc of evenly-sized dots. It now reads as a funnel seen
+down its axis: grit at the core swelling to rocks at the rim, so **size alone
+carries the depth**. Nothing moves in z — the eye just reads "smaller and
+denser" as "further away".
+
+- `SPIRAL_FILL` 0.4 → **0.78** of the short edge
+- `SPIRAL_DOT_INNER` 0.4px → `SPIRAL_DOT_OUTER` 4.2px, linear in radius
+- Grid pitch `w/46` → **`w/62`** (N ≈ 1400 → 2370)
+
+**A wrong turn worth recording.** My first attempt measured the radius against
+the screen's DIAGONAL, reasoning that the arms should reach the corners. That
+is exactly backwards: it put the rim *past* the corners, so the entire outer
+half of the funnel — the big dots, the part carrying the effect — sat
+off-screen, and all that remained on screen was the small, sparse core. It
+looked *worse* than before while the numbers said it was twice as big. Only
+dumping `maxRadius` and the outermost particle's actual radius into
+`document.title` settled it; three rounds of squinting at screenshots had me
+convinced the code wasn't running at all.
+
+**Side effects**
+- **Density had to follow the radius.** The grid's particle count is also the
+  spiral's particle count, so nearly doubling the outer radius over the same
+  count left the arms as scattered specks. More particles also means a finer
+  opening grid and more star sub-dots — still well inside `MAX_DOTS`.
+- `spiralDotR` is separate from `dustR` on purpose. `dustR` also draws the
+  WORDS, where position has nothing to do with spiral radius, and a 10x size
+  spread there would just look lumpy. The two crossfade during
+  `toWord`/`toSpiral` so neither look leaks into the other.
+- Removed `escutcheonShape`/`keyholeShape` from `door3d.js` — dead since the
+  lock moved to `lock3d.js`, and duplicated geometry definitions are precisely
+  the thing that drifts apart.
+
+---
+
 ## 2026-08-06 — The dots never had depth turned on ✅
 
 `src/dotsGL.js`, `src/spiralEngine.js`

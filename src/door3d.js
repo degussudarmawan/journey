@@ -43,6 +43,24 @@ import {
 } from "./doorAssets";
 
 const FOV = 42; // vertical field of view, degrees
+/**
+ * How much of the viewport the door LEAVES fill once the door has finished
+ * approaching.
+ *
+ * 1 on purpose: the arrival is meant to end with the leaves BEING the screen,
+ * so the artwork is finally readable at full size. The frame is built outside
+ * them, which means it does its job while the door stands off in the room —
+ * reading the object as a door rather than a floating rectangle — and then
+ * passes beyond the viewport as the door comes forward. A frame still visible
+ * at the end would be eating the artwork exactly when it's worth looking at.
+ *
+ * Below 1 the leaves stop being the screen, and everything positioned "as a
+ * fraction of the door" becomes a fraction of THIS rather than of the
+ * viewport — the lock metrics, the cleared field, the key's scale and its
+ * flight target all read it. It is wired through so the choice stays open;
+ * just don't assume the two rectangles are the same again.
+ */
+export const DOOR_FILL = 1;
 export const LEAF_DEPTH_FRAC = 0.014; // leaf thickness, as a fraction of door height
 const OPEN_ANGLE = Math.PI * 0.62; // how far the leaves swing when fully open
 const NORMAL_MAP_SCALE = 0.5; // relief is low-frequency; half-res is plenty
@@ -328,7 +346,7 @@ export class Door3D {
     this.ok = false;
     this.built = null; // {W, H, text} the current geometry was built for
     this.assets = null; // user artwork from doorAssets.js, once loaded
-    this.state = { alpha: 0, open: 0, plateAlpha: 1 };
+    this.state = { alpha: 0, rise: 1, approach: 1, open: 0, plateAlpha: 1 };
     this._alphaApplied = -1;
     this._disposables = [];
   }
@@ -444,6 +462,7 @@ export class Door3D {
     // Place the camera so the plane z = 0 spans exactly H world units
     // vertically — i.e. one world unit per CSS pixel, origin at screen centre.
     const dist = H / 2 / Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+    this._camDist = dist;
     this.camera.position.set(0, 0, dist);
     this.camera.lookAt(0, 0, 0);
     this.camera.updateProjectionMatrix();
@@ -466,12 +485,17 @@ export class Door3D {
     // the key can be ONE mesh under ONE set of lights for the whole sequence.
     // Its dimensions are still needed here, though: the leaf artwork has to
     // have the lock's footprint cleared out of it.
-    const lockM = lockMetrics(keyDef, keyScale, W, H);
+    // The leaves stop short of the viewport so the frame has somewhere to be.
+    // EVERY door-relative measurement below is a fraction of these, not of the
+    // screen — the two stopped being the same thing when the frame arrived.
+    const DW = W * DOOR_FILL;
+    const DH = H * DOOR_FILL;
+    const lockM = lockMetrics(keyDef, keyScale, DW, DH);
 
     // ---- leaves ----
-    const leafW = W / 2;
+    const leafW = DW / 2;
     const depth = Math.max(6, H * LEAF_DEPTH_FRAC);
-    const geo = track(new THREE.BoxGeometry(leafW, H, depth));
+    const geo = track(new THREE.BoxGeometry(leafW, DH, depth));
 
     // Clear the ornament out from under the lock, so the ironwork reads as
     // laid out around it rather than running behind it. A shade larger than
@@ -479,9 +503,9 @@ export class Door3D {
     // belong to the same surface.
     const fieldW = lockM.pw * 0.72;
     const fieldH = lockM.ph * 0.62;
-    const clearedColour = clearLockField(leafColour, W, H, fieldW, fieldH);
+    const clearedColour = clearLockField(leafColour, DW, DH, fieldW, fieldH);
     const clearedHeight = leafHeight
-      ? clearLockField(leafHeight, W, H, fieldW, fieldH)
+      ? clearLockField(leafHeight, DW, DH, fieldW, fieldH)
       : null;
 
     const colourTex = track(tex(clearedColour, { srgb: true }));
@@ -535,20 +559,82 @@ export class Door3D {
     // Rotating the pivot then swings the leaf about the hinge rather than
     // about its own centre, which is what a door actually does.
     this.leftPivot = new THREE.Group();
-    this.leftPivot.position.set(-W / 2, 0, 0);
+    this.leftPivot.position.set(-DW / 2, 0, 0);
     const left = new THREE.Mesh(geo, mats(false));
     left.position.x = leafW / 2;
     left.receiveShadow = true; // takes the lock plate's shadow
     this.leftPivot.add(left);
 
     this.rightPivot = new THREE.Group();
-    this.rightPivot.position.set(W / 2, 0, 0);
+    this.rightPivot.position.set(DW / 2, 0, 0);
     const right = new THREE.Mesh(geo, mats(true));
     right.position.x = -leafW / 2;
     right.receiveShadow = true;
     this.rightPivot.add(right);
 
-    this.root.add(this.leftPivot, this.rightPivot);
+    // The leaves ride their own group so the whole door can be MOVED — up from
+    // the floor, then forward toward the viewer. The backdrop deliberately
+    // stays out of it: it represents what lies beyond the doorway, so it must
+    // not travel with the door.
+    this.doorGroup = new THREE.Group();
+    this.doorGroup.add(this.leftPivot, this.rightPivot);
+
+    // ---- frame ----
+    // A doorway around the leaves: jambs, a heavier lintel, and a heavier
+    // threshold still. Built OUTSIDE the leaves rather than inset into them,
+    // which is what lets it do its job at both ends of the journey — it reads
+    // the door as a door while it stands off in the room, then falls beyond
+    // the viewport once the door has come forward and the leaves are meant to
+    // BE the screen. Inset instead and it would eat the artwork exactly when
+    // the artwork is finally readable, and drag the keyhole off-centre with it.
+    const jamb = Math.min(W, H) * 0.055;
+    const lintel = jamb * 1.35; // classical doorways are top-heavy
+    const sill = jamb * 2.1; // and heavier again where they meet the floor
+    const frameShape = new THREE.Shape();
+    frameShape.moveTo(-DW / 2 - jamb, -DH / 2 - sill);
+    frameShape.lineTo(DW / 2 + jamb, -DH / 2 - sill);
+    frameShape.lineTo(DW / 2 + jamb, DH / 2 + lintel);
+    frameShape.lineTo(-DW / 2 - jamb, DH / 2 + lintel);
+    frameShape.closePath();
+    const opening = new THREE.Path();
+    opening.moveTo(-DW / 2, -DH / 2);
+    opening.lineTo(-DW / 2, DH / 2);
+    opening.lineTo(DW / 2, DH / 2);
+    opening.lineTo(DW / 2, -DH / 2);
+    opening.closePath();
+    frameShape.holes.push(opening);
+
+    const frameDepth = depth * 2.6; // stands proud of the leaves it surrounds
+    const frameGeo = track(
+      new THREE.ExtrudeGeometry(frameShape, {
+        depth: frameDepth,
+        bevelEnabled: true,
+        bevelThickness: jamb * 0.16,
+        bevelSize: jamb * 0.16,
+        bevelSegments: 2,
+      }),
+    );
+    frameGeo.translate(0, 0, -frameDepth / 2); // straddle the leaves
+    const frame = new THREE.Mesh(
+      frameGeo,
+      track(
+        new THREE.MeshStandardMaterial({
+          color: 0x4a4759,
+          metalness: 0.55,
+          roughness: 0.45,
+          envMapIntensity: 1.0,
+        }),
+      ),
+    );
+    frame.castShadow = true; // onto the leaves, which already receive
+    this.doorGroup.add(frame);
+
+    this.root.add(this.doorGroup);
+    this._riseFrom = -H * 2; // fully below the frame, even at its far depth
+    // How far back the door hovers before it approaches. About one and a half
+    // camera distances, which lands it near 40% of full size — reads as a real
+    // object standing off in the room rather than a shrunken overlay.
+    this._farZ = -this._camDist * 1.55;
 
     // ---- backdrop ----
     // Oversized and set well back, so it still covers the frame once the
@@ -560,19 +646,30 @@ export class Door3D {
       ),
     );
     back.position.z = -H * 0.75;
+    // Only ever seen through an opening door. Left visible it would paper over
+    // the room the door is supposed to be standing in.
+    back.visible = false;
+    this.backdrop = back;
     this.root.add(back);
 
   }
 
   /**
-   * @param {{alpha?: number, open?: number, plateAlpha?: number}} s
-   *   alpha 0..1 fade of the whole door, open 0 = shut / 1 = wide,
-   *   plateAlpha 0..1 opacity of the lock plate.
+   * @param {object} s
+   * @param {number} [s.alpha]  0..1 fade of the whole layer
+   * @param {number} [s.rise]   0 = below the floor, 1 = risen into the room
+   * @param {number} [s.approach] 0 = standing off in the room, 1 = filling
+   *   the frame. The door travels to the viewer rather than the viewer to it;
+   *   from the front the two are the same picture, and moving one object is
+   *   far less to keep in step than moving a camera that everything else is
+   *   positioned against.
+   * @param {number} [s.open]   0 = shut, 1 = wide
+   * @param {number} [s.plateAlpha] opacity of the lock plate
    */
   setState(s) {
-    if (s.alpha !== undefined) this.state.alpha = s.alpha;
-    if (s.open !== undefined) this.state.open = s.open;
-    if (s.plateAlpha !== undefined) this.state.plateAlpha = s.plateAlpha;
+    for (const k of ["alpha", "rise", "approach", "open", "plateAlpha"]) {
+      if (s[k] !== undefined) this.state[k] = s[k];
+    }
   }
 
   render() {
@@ -585,6 +682,18 @@ export class Door3D {
       this._alphaApplied = a;
     }
     if (a <= 0.001 || !this.built) return;
+
+    // Slide up out of the floor, then travel forward into the frame. Two
+    // separate journeys rather than one blended move: the door has to come to
+    // a visible rest standing in the room before it starts approaching, and a
+    // single interpolation would round that corner off into a diagonal drift.
+    if (this.doorGroup) {
+      const rise = this.state.rise;
+      const approach = this.state.approach;
+      this.doorGroup.position.y = this._riseFrom * (1 - rise);
+      this.doorGroup.position.z = this._farZ * (1 - approach);
+    }
+    if (this.backdrop) this.backdrop.visible = this.state.open > 0.001;
 
     const angle = this.state.open * OPEN_ANGLE;
     if (this.leftPivot) this.leftPivot.rotation.y = -angle;

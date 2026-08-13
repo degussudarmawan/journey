@@ -67,6 +67,7 @@ import { keyForSpike } from "./keys";
 import { drawKey3D, sampleKeyLocalPoints } from "./keyRenderer";
 import { buildDoorArt, drawDoor } from "./door";
 import { DOOR_LOCK_Y } from "./doorAssets";
+import { DOOR_FILL } from "./door3d";
 
 export const DEFAULT_PALETTE = ["#c98a8a", "#8aa8c9", "#8ec9a6", "#b98ac9"];
 
@@ -724,13 +725,21 @@ export class SpiralEngine {
   // the door swings open. All of it is driven off one 0..1 progress value, so
   // the phases below just carve up that range and overlap where a hand-off
   // should feel continuous.
-  UNLOCK_SECS = 4.6;
-  U_CLEAR = [0.0, 0.2]; // other pieces sweep off screen
-  U_DOOR_IN = [0.02, 0.26]; // door fades up behind them
-  U_FLIGHT = [0.16, 0.52]; // key travels to the keyhole and turns face-on
-  U_INSERT = [0.52, 0.63]; // key seats into the hole
-  U_TURN = [0.63, 0.79]; // key rotates — the actual unlocking
-  U_SWING = [0.79, 1.0]; // door opens
+  // The unlock is staged as a journey through a room rather than a cut to a
+  // door. The whitespace IS the room: the door rises out of its floor, comes
+  // to rest standing at a distance behind the still-orbiting pieces, and only
+  // then travels forward until it fills the frame. Overlaps are deliberate —
+  // each move starts before the last has quite settled, so the sequence reads
+  // as one continuous action instead of a list of steps.
+  UNLOCK_SECS = 6.4;
+  U_RISE = [0.0, 0.26]; // door slides up out of the floor, far off
+  U_CLEAR = [0.2, 0.36]; // the remaining pieces sweep away
+  U_APPROACH = [0.28, 0.54]; // door travels forward until it fills the frame
+  U_FLIGHT = [0.34, 0.62]; // key crosses to the keyhole, travelling WITH the
+  //   approach rather than after it, so the two read as one movement inward
+  U_INSERT = [0.62, 0.74]; // key seats into the hole
+  U_TURN = [0.74, 0.88]; // key rotates — the actual unlocking
+  U_SWING = [0.88, 1.0]; // door opens
   KEY_DOOR_SCALE = 0.26; // key height at the door, as a fraction of min(w,h)
   KEY_PIVOT_Y = 0.72; // point along the key (local units) that enters the hole
   // How far the key rotates to unlock. The turn is about the SHAFT, so the
@@ -1229,7 +1238,8 @@ export class SpiralEngine {
   /** World units per key unit once the key is at the door. */
   keyDoorScale() {
     const { w, h } = this.dims;
-    return (Math.min(w, h) * this.KEY_DOOR_SCALE) / 2.4;
+    // Sized against the DOOR, not the viewport — the frame means those differ.
+    return (Math.min(w, h) * DOOR_FILL * this.KEY_DOOR_SCALE) / 2.4;
   }
 
   /** 0 while nothing is selected, ramping to 1 as the morph completes. */
@@ -1339,7 +1349,7 @@ export class SpiralEngine {
     // The keyhole is not necessarily at screen centre — DOOR_LOCK_Y puts it
     // wherever the door art leaves a clear band. Without this the key flies
     // to the middle of the screen and the lock is somewhere else.
-    const lockY = (DOOR_LOCK_Y - 0.5) * h;
+    const lockY = this.dotsGL?.lockScreenY() ?? (DOOR_LOCK_Y - 0.5) * h;
     // Land in FRONT of the lock plate, not on the door's own plane. The plate
     // stands proud of the surface, so ending at z = 0 puts the key behind it
     // for the whole late approach and then snaps it forward at the handoff.
@@ -1367,10 +1377,18 @@ export class SpiralEngine {
       const l = Math.hypot(v[0], v[1], v[2]) || 1;
       return [v[0] / l, v[1] / l, v[2] / l];
     };
+    // DEPTH ARRIVES FIRST. The lock fades in partway through the flight, and
+    // a key still at ring depth when that happens is behind the plate — it
+    // spends the rest of the crossing occluded and then pops through. Pulling
+    // the key forward early means it is clear of the lock before the lock
+    // exists, and the remaining travel is across the frame rather than into
+    // it. Reads as "brought to the front, then carried across", which is also
+    // the more legible of the two.
+    const tZ = this.clamp(t * 2.2, 0, 1);
     const O = [
       this.lerp(o0[0], o1[0], t),
       this.lerp(o0[1], o1[1], t),
-      this.lerp(o0[2], o1[2], t),
+      this.lerp(o0[2], o1[2], tZ),
     ];
     const X = mix3(x0, x1);
     const Y = mix3(y0, y1);
@@ -1818,14 +1836,22 @@ export class SpiralEngine {
       // end of the flight). Read again further down to fade the 2D key out.
       this._keyHandoff = 0;
       if (u > 0) {
-        const doorIn = this.phase(u, this.U_DOOR_IN);
+        const rise = this.phase(u, this.U_RISE);
+        const approach = this.phase(u, this.U_APPROACH);
         const swing = this.phase(u, this.U_SWING);
         if (this.door3d?.ok) {
           // The 3D door lives on its own canvas *behind* this one, so it
           // isn't drawn here — it just gets told what to look like, and
           // renders itself at the end of the frame.
+          //
+          // alpha stays at 1 throughout: the door ARRIVES rather than fades
+          // in. It starts below the floor of the room, so there is nothing to
+          // hide, and a fade would undercut the illusion that it's a solid
+          // thing entering a space.
           this.door3d.setState({
-            alpha: doorIn,
+            alpha: 1,
+            rise,
+            approach,
             open: swing,
             plateAlpha: 1 - swing,
           });
@@ -1843,10 +1869,15 @@ export class SpiralEngine {
           );
           // The lock lives in the dots scene now (see lock3d.js), so it fades
           // with the door rather than being part of it.
-          this.dotsGL?.setLockAlpha(doorIn * (1 - swing));
+          // The lock only exists once the door has arrived. It's drawn at
+          // full-screen scale in the dots scene, so showing it while the door
+          // is still small and far off would float a giant escutcheon in
+          // mid-air. Fade it in over the last of the approach.
+          const lockIn = this.smoothstep(0.72, 1, approach);
+          this.dotsGL?.setLockAlpha(lockIn * (1 - swing));
         } else if (this.doorArt) {
           ctx.save();
-          ctx.globalAlpha = doorIn;
+          ctx.globalAlpha = approach; // 2D fallback has no room to fly in from
           drawDoor(ctx, this.doorArt, w, h, swing, 1 - swing);
           ctx.restore();
         }

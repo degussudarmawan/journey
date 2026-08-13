@@ -26,7 +26,7 @@
 import * as THREE from "three";
 import { buildKeyMesh } from "./key3d";
 import { buildLock, lockMetrics } from "./lock3d";
-import { LEAF_DEPTH_FRAC } from "./door3d";
+import { DOOR_FILL, LEAF_DEPTH_FRAC } from "./door3d";
 
 const MAX_DOTS = 24000; // ~1.6k particles x 4 halftone sub-dots, with headroom
 
@@ -122,11 +122,14 @@ const FRAG = /* glsl */ `
     // filled SQUARE, because a tiny antialiased circle turns to grey mush and
     // a square stays crisp. Reproducing that here is what makes this a fair
     // comparison rather than a flattering one.
+    // Now that dots write depth, a nearly-invisible fragment would still
+    // stamp the buffer and punch a hole in whatever is behind it. Drop them.
+    if (vAlpha < 0.06) discard;
     if (vSize >= 3.2) {
       float d = length(gl_PointCoord - vec2(0.5));
       float aa = fwidth(d);
       float m = 1.0 - smoothstep(0.5 - aa, 0.5, d);
-      if (m <= 0.0) discard;
+      if (m <= 0.02) discard;
       gl_FragColor = vec4(vTint, vAlpha * m);
       return;
     }
@@ -197,8 +200,17 @@ export class DotsGL {
       fragmentShader: FRAG,
       uniforms: { pixelRatio: { value: this.pixelRatio } },
       transparent: true,
-      depthTest: false,
-      depthWrite: false,
+      // Real depth, which is the entire point of moving the dots here. Left
+      // off (as it was through the prototype) nothing can occlude the key: it
+      // draws over every dot regardless of where it is in the ring, so a key
+      // on the ring's FAR side still paints over the near needles and the
+      // orbit stops reading as an orbit at all.
+      //
+      // depthWrite matters as much as depthTest — without it the dots test
+      // against the key but never record themselves, so the key is never
+      // hidden BY them, only they by it.
+      depthTest: true,
+      depthWrite: true,
     });
 
     this.points = new THREE.Points(g, this.material);
@@ -256,12 +268,17 @@ export class DotsGL {
     // Must match the door's leaf thickness: the plate stands off that surface.
     const leafDepth = Math.max(6, H * LEAF_DEPTH_FRAC);
     if (!this.ok || !keyDef) return;
+    // The lock belongs to the DOOR, not the screen, and the door no longer
+    // fills the screen — the frame takes the rest. Measuring against the
+    // viewport here would drift the keyhole off the artwork's cleared field.
+    const DW = W * DOOR_FILL;
+    const DH = H * DOOR_FILL;
     const sig = `${W}x${H}:${keyDef.id}:${Math.round(keyScale * 100)}`;
     if (this._lockSig === sig) return;
     this._lockSig = sig;
     this._teardownLock();
 
-    const m = lockMetrics(keyDef, keyScale, W, H);
+    const m = lockMetrics(keyDef, keyScale, DW, DH);
     this.lock = buildLock(m, leafDepth);
     this.scene.add(this.lock.group);
 
@@ -308,6 +325,18 @@ export class DotsGL {
    */
   keyRestZ() {
     return this._keyZOut ?? 0;
+  }
+
+  /**
+   * The keyhole's height in ENGINE coordinates (y down, origin screen centre)
+   * — where the key has to fly to.
+   *
+   * Read from the built lock rather than recomputed by the caller. The same
+   * value derived in two places is what put the key and the keyhole in
+   * different spots every time the door's proportions changed.
+   */
+  lockScreenY() {
+    return -(this._lockY ?? 0);
   }
 
   /** Hides the key. */

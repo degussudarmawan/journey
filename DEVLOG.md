@@ -9,6 +9,126 @@ Legend: **✅ verified** = I actually looked at it rendering.
 
 ---
 
+## 2026-08-06 — The door has a doorway ✅
+
+`src/door3d.js`, `src/dotsGL.js`, `src/spiralEngine.js`
+
+Added a frame: jambs, a heavier lintel, a heavier sill again where it meets
+the floor. Extruded and bevelled, casting onto the leaves it surrounds.
+
+The leaves used to be exactly the viewport, which is why there was no border
+to have — the door bled off every edge. They now fill **`DOOR_FILL` (0.9)** of
+it and the frame takes the rest.
+
+**That 0.9 is the thing to be careful with.** The leaves and the screen used to
+be the same rectangle, and a lot of code quietly assumed it. Anything
+positioned "as a fraction of the door" is now a fraction of the *door*:
+
+- `lockMetrics` is passed the leaf size, not the viewport
+- `clearLockField` maps its ellipse against the leaf
+- `keyDoorScale()` scales by `DOOR_FILL`
+- the key's flight reads its target from **`dotsGL.lockScreenY()`** instead of
+  deriving it again from viewport height
+
+That last one is the pattern that keeps paying off here: the same value
+computed independently in two places is what has put the key and the keyhole
+in different spots every single time the door's proportions changed. Now the
+lock is built once and everything else asks it.
+
+**Side effects**
+- The frame is visible at BOTH ends of the journey now — reading the object as
+  a door while it stands off in the room, and giving it an edge once it fills
+  the frame. Earlier it was outside the viewport at full approach.
+- `DOOR_FILL` is exported from `door3d` and imported by `dotsGL` and the
+  engine. Three modules now share it; changing it moves the lock, the key's
+  scale and the cleared field together, which is the point.
+- The door keeps the viewport's aspect, so at a distance it reads as a wide
+  doorway rather than a tall one. A portrait door would need the leaves to
+  stop matching the screen's shape, which reopens everything above.
+
+---
+
+## 2026-08-06 — The dots never had depth turned on ✅
+
+`src/dotsGL.js`, `src/spiralEngine.js`
+
+**1. The key always drew over the dots.** The dots material still carried
+`depthTest: false, depthWrite: false` — correct for the prototype, where the
+header said in as many words that *real depth is the prize for migrating, not
+something to prototype*. I migrated and never turned it on. So the key painted
+over every dot regardless of where it sat in the ring, and a key on the ring's
+FAR side still covered the near needles: the orbit stopped reading as an orbit.
+
+Both flags now on. `depthWrite` matters as much as `depthTest` — without it
+the dots test against the key but never record themselves, so the key is never
+hidden *by* them, only they by it. The fragment shader also discards
+near-invisible fragments now, since a barely-there dot would otherwise stamp
+the depth buffer and punch a hole in whatever is behind it.
+
+**2. The key passed behind the lock mid-flight.** The lock fades in partway
+through the crossing, and a key still at ring depth when that happens is behind
+the plate for the rest of the flight, then pops through. Depth now arrives
+first (`tZ = t * 2.2`): the key is pulled clear of the lock before the lock
+exists, and the remaining travel is *across* the frame rather than into it.
+
+**Side effects**
+- Dots are alpha-blended AND write depth, which is normally a bad combination:
+  a dot drawn early occludes a dot behind it even where it's semi-transparent.
+  Invisible here because the marks are small and near-opaque, and the discard
+  threshold keeps the soft edges out of the buffer. If halos ever show up
+  around dots, that pairing is the cause.
+- Front-loading depth means the key comes toward the viewer, then travels
+  across. Reads as "brought forward, then carried over" — deliberate, and the
+  more legible of the two orderings, but it is not a straight line.
+
+---
+
+## 2026-08-06 — The door arrives in a room instead of fading in ✅
+
+`src/door3d.js`, `src/spiralEngine.js`
+
+Re-choreographed the unlock. The door used to fade up in place, which reads as
+a cut. It now treats the whitespace as a **room**: it slides up out of the
+floor, comes to rest standing at a distance behind the still-orbiting pieces,
+and only then travels forward until it fills the frame — at which point the
+existing insert/turn/swing takes over unchanged.
+
+`UNLOCK_SECS` 4.6 → **6.4**, and the phases restaged:
+
+| phase | when | what |
+|---|---|---|
+| `U_RISE` | 0.00–0.26 | door slides up out of the floor, far off |
+| `U_CLEAR` | 0.20–0.36 | remaining pieces sweep away |
+| `U_APPROACH` | 0.28–0.54 | door travels forward to fill the frame |
+| `U_FLIGHT` | 0.34–0.62 | key crosses to the keyhole |
+| `U_INSERT` / `U_TURN` / `U_SWING` | 0.62–1.00 | unchanged |
+
+Overlaps are deliberate — each move starts before the last has quite settled,
+so it reads as one continuous action rather than a list of steps. The flight
+runs *with* the approach, not after it, so key and door move inward together.
+
+**The door travels to the viewer, not the viewer to the door.** From the front
+those are the same picture, and moving one object is far less to keep in step
+than moving a camera that everything else is positioned against.
+
+**Side effects**
+- `alpha` is now pinned at 1 for the whole sequence. The door starts below the
+  floor, so there's nothing to hide, and a fade would undercut the illusion
+  that it's a solid thing entering a space. `U_DOOR_IN` is gone.
+- The leaves moved into their own `doorGroup` so the door can travel;
+  **the backdrop deliberately stayed out of it**, since it represents what lies
+  beyond the doorway and must not travel with the door. It's also hidden until
+  `open > 0` — left visible it papers over the room the door stands in.
+- The lock fades in over the last quarter of the approach. It's drawn at
+  full-screen scale in the dots scene, so showing it earlier would float a
+  giant escutcheon in mid-air next to a small distant door.
+- The key looks large against the far door during the approach. That's correct
+  perspective, not a bug — it's near the viewer and the door is across the
+  room.
+- The 2D fallback still fades; it has no room to fly in from.
+
+---
+
 ## 2026-08-06 — Flight was landing behind the plate ✅
 
 `src/spiralEngine.js`, `src/dotsGL.js`

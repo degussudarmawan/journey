@@ -9,42 +9,96 @@ Legend: **✅ verified** = I actually looked at it rendering.
 
 ---
 
-## 2026-08-06 — The door has a doorway ✅
+## 2026-08-14 — Randomly black dots: a palette shorter than its slots ✅
 
-`src/door3d.js`, `src/dotsGL.js`, `src/spiralEngine.js`
+`src/spiralEngine.js`, `src/dotsGL.js`
 
-Added a frame: jambs, a heavier lintel, a heavier sill again where it meets
-the floor. Extruded and bevelled, casting onto the leaves it surrounds.
+User: "why r u bringing back the black sampling". Their word for it was exact —
+it *was* sampling, and it was returning black.
 
-The leaves used to be exactly the viewport, which is why there was no border
-to have — the door bled off every edge. They now fill **`DOOR_FILL` (0.9)** of
-it and the frame takes the rest.
+`App.jsx` passes `accentPalette={['#f1f10e']}`: one colour. But `colorSlot` is
+rolled once at build time against a **fixed count of four**, so slots 1..3
+index past the end and read as `undefined`. Assigning `undefined` to
+`fillStyle` is a **silent no-op** — the context keeps whatever it held — so
+`ColorCache` sampled black on a fresh context and then cached that under the
+`undefined` key forever.
 
-**That 0.9 is the thing to be careful with.** The leaves and the screen used to
-be the same rectangle, and a lot of code quietly assumed it. Anything
-positioned "as a fraction of the door" is now a fraction of the *door*:
+That is also the "random black dots" reported days earlier, which I misdiagnosed
+as size jitter and "fixed" by deleting `SPIRAL_DOT_JITTER`. The jitter was
+innocent. This had been live since the palette was cut to one colour.
 
-- `lockMetrics` is passed the leaf size, not the viewport
-- `clearLockField` maps its ellipse against the leaf
-- `keyDoorScale()` scales by `DOOR_FILL`
-- the key's flight reads its target from **`dotsGL.lockScreenY()`** instead of
-  deriving it again from viewport height
-
-That last one is the pattern that keeps paying off here: the same value
-computed independently in two places is what has put the key and the keyhole
-in different spots every single time the door's proportions changed. Now the
-lock is built once and everything else asks it.
+- `slotColor(slot, palette)` wraps the index into the palette's real length, so
+  every slot resolves to a real colour whatever length it is. Used by the main
+  draw and the star branch.
+- `ColorCache` now sets a known magenta before attempting the parse, so a
+  colour that fails to parse shows up as obvious magenta rather than as a
+  mystery black that looks like a rendering bug.
 
 **Side effects**
-- The frame is visible at BOTH ends of the journey now — reading the object as
-  a door while it stands off in the room, and giving it an edge once it fills
-  the frame. Earlier it was outside the viewport at full approach.
-- `DOOR_FILL` is exported from `door3d` and imported by `dotsGL` and the
-  engine. Three modules now share it; changing it moves the lock, the key's
-  scale and the cleared field together, which is the point.
-- The door keeps the viewport's aspect, so at a distance it reads as a wide
-  doorway rather than a tall one. A portrait door would need the leaves to
-  stop matching the screen's shape, which reopens everything above.
+- With a one-colour palette the 40% of particles that aren't `INK` all get that
+  same colour, so the field is effectively two-tone. Not a bug — but the
+  variety only comes back by adding palette entries.
+- **Slot count and palette length are still independent.** `colorSlot` is baked
+  in `buildGrid` and the palette is a live prop; wrapping at draw time is what
+  keeps them safe, so anything new that reads `palette[...]` directly
+  reintroduces this.
+
+---
+
+## 2026-08-14 — Landing polka dots, and disintegration ✅
+
+`src/spiralEngine.js`
+
+Reference supplied for the landing page: big dots, generous gaps. The dots
+weren't just small — the **pitch** was wrong, and the dot-to-gap ratio was
+already about right at ~0.14.
+
+**The constraint:** the landing grid IS the particle pool for every later
+stage. Thinning it to get the spacing would strip the words and the starburst
+of the particles they're built from. So the landing draws a **sparse subset** —
+one dot per `LANDING_STRIDE^2` — and the rest of the pool is hidden until the
+explosion.
+
+- `LANDING_STRIDE = 5`, kept **odd**: the grid is bricked, so an even stride
+  picks rows offset the same way and the stagger disappears.
+- The brick had to be **re-derived at the subset's scale**. Inheriting the
+  grid's own half-pitch stagger gave a 14px nudge against a 140px gap — a 10%
+  wobble that reads as misalignment, not pattern. Alternate landing rows now
+  shift by half a stride.
+- `GRID_DOT_FRAC` (0.15) sizes the dot against the LANDING pitch;
+  `GRID_DOT_FRAC_DENSE` (0.16) against the full grid pitch, seen mid-explosion.
+
+**Then the transition, in three passes** — each fixing what the last revealed:
+
+1. Hidden dots faded in **at their own grid cells**, so the full 46-column
+   lattice materialised beneath the 9-column polka dots. Two regular patterns
+   at different scales in one space read as *two layers* however the opacity is
+   tuned.
+2. Started them stacked at their **parent's centre** instead, growing from zero
+   size rather than fading — fading in is still *appearing*, just softly;
+   growing from a point means no frame where a dot exists without having come
+   from somewhere. Better, but it's a disc *spraying*, not coming apart.
+3. **Disintegration**: every particle in a cell — the landing dot included — is
+   a fragment scattered across the parent's face. The disc IS its pieces, so it
+   comes to bits rather than emitting them.
+
+**Side effects**
+- Fragments are placed within `landingR - fragR`, bounding the whole PIECE
+  rather than its centre. Scattering centres across the full radius lets each
+  fragment hang its own radius past the edge, and the resting polka dots come
+  out as lumpy clusters instead of circles.
+- The landing dot **holds its size briefly** before shrinking to a fragment. It
+  is the clean circle the eye is already tracking, and it covers the pieces
+  while they are still packed tightly enough for their silhouette to matter.
+- **Size settles faster than position** (`m * 2.4`). A fragment must be ~2x the
+  spiral's dot size to help cover its polka dot at rest, so carrying that size
+  the whole way sends visible chunks into a field of much finer dots. This is a
+  real tension — `fragR` is forced by coverage, `SPIRAL_DOT_BASE` by the funnel
+  — so they can't be one number; decoupling *when* each applies resolves it.
+- The explosion is staggered by `delayFrac`, so the split ripples out from the
+  centre rather than every dot bursting at once.
+- Over-coverage factor `1.7` in `fragR`: below it the resting dots start
+  reading as gravel rather than circles.
 
 ---
 
@@ -110,6 +164,54 @@ as noise rather than distance.
 - Size and haze are now driven by *different* inputs (z vs radius) on purpose.
   That was a bug the last three times it happened by accident — the difference
   is that one of them is physical and the other is a stylistic overlay.
+
+---
+
+## 2026-08-06 — The door has a doorway ✅
+
+`src/door3d.js`, `src/dotsGL.js`, `src/spiralEngine.js`
+
+Added a frame: jambs, a heavier lintel, a heavier sill again where it meets
+the floor. Extruded and bevelled, casting onto the leaves it surrounds.
+
+The leaves used to be exactly the viewport, which is why there was no border
+to have — the door bled off every edge. They were set to fill **`DOOR_FILL`
+(0.9)** of it, with the frame taking the rest.
+
+> **Reverted the same day: `DOOR_FILL` is back to 1.** Insetting the leaves put
+> a border on screen at full approach, but it also meant the arrival no longer
+> ended with the artwork at full size — user: *"why is it not full screen when
+> zoom in? this part shud stay the same as before"*. The frame lives OUTSIDE
+> the leaves again, so it does its job while the door stands off in the room
+> and passes beyond the viewport as the door comes forward. The plumbing below
+> stayed: `DOOR_FILL` is still threaded through everything, it just evaluates
+> to 1, so the choice is a one-line change rather than a re-derivation.
+
+**That 0.9 is the thing to be careful with.** The leaves and the screen used to
+be the same rectangle, and a lot of code quietly assumed it. Anything
+positioned "as a fraction of the door" is now a fraction of the *door*:
+
+- `lockMetrics` is passed the leaf size, not the viewport
+- `clearLockField` maps its ellipse against the leaf
+- `keyDoorScale()` scales by `DOOR_FILL`
+- the key's flight reads its target from **`dotsGL.lockScreenY()`** instead of
+  deriving it again from viewport height
+
+That last one is the pattern that keeps paying off here: the same value
+computed independently in two places is what has put the key and the keyhole
+in different spots every single time the door's proportions changed. Now the
+lock is built once and everything else asks it.
+
+**Side effects**
+- The frame is visible at BOTH ends of the journey now — reading the object as
+  a door while it stands off in the room, and giving it an edge once it fills
+  the frame. Earlier it was outside the viewport at full approach.
+- `DOOR_FILL` is exported from `door3d` and imported by `dotsGL` and the
+  engine. Three modules now share it; changing it moves the lock, the key's
+  scale and the cleared field together, which is the point.
+- The door keeps the viewport's aspect, so at a distance it reads as a wide
+  doorway rather than a tall one. A portrait door would need the leaves to
+  stop matching the screen's shape, which reopens everything above.
 
 ---
 

@@ -134,6 +134,18 @@ export class SpiralEngine {
   // middle rather than a field receding. Radius spreads the same amount of
   // fade evenly over everything on screen.
   SPIRAL_FADE_CURVE = 0.85; // <1 biases a little more fade into the mid-field
+  // ---- Landing polka dots ----
+  // Show one dot in every LANDING_STRIDE^2 of the grid. The dot's own radius
+  // is a fraction of that WIDER pitch, which is what makes the pattern read
+  // as generous polka dots rather than a dense speckle: a big dot in a tight
+  // lattice is just as busy as a small one, only heavier. What relaxes it is
+  // the gap, and the gap comes from the stride.
+  //
+  // Keep the stride ODD — the grid is bricked, so an even stride picks rows
+  // that are all offset the same way and the stagger disappears.
+  LANDING_STRIDE = 5;
+  GRID_DOT_FRAC = 0.15; // dot radius as a fraction of the pitch it sits in
+  GRID_DOT_FRAC_DENSE = 0.16; // ...and of the FULL grid pitch, mid-explosion
   // ---- Comet trails ----
   // Each dot is followed by a few samples of where it actually was, so the
   // tail's length is its real speed rather than a decoration: outer dots
@@ -204,6 +216,26 @@ export class SpiralEngine {
       tPanY: 0,
     };
     this._drag = null;
+  }
+
+  /**
+   * The colour for a particle's slot, safe against a palette shorter than the
+   * four slots buildGrid assigns.
+   *
+   * Slots are rolled once, at build time, against a fixed count of four. The
+   * palette is a PROP and can be any length — pass one colour and slots 1..3
+   * index past the end. That reads as `undefined`, and assigning `undefined`
+   * to `fillStyle` is a silent no-op, so the colour that actually gets used is
+   * whatever the canvas happened to hold: black on a fresh context, and then
+   * cached under that key forever. Hence dots that are randomly black for no
+   * reason anyone can find in the palette.
+   *
+   * Wrapping the index keeps every slot pointing at a real colour whatever
+   * length the palette is.
+   */
+  slotColor(slot, palette) {
+    if (slot === -1 || !palette || !palette.length) return this.INK;
+    return palette[slot % palette.length] || this.INK;
   }
 
   // ---- Small math helpers -----------------------------------------------
@@ -284,7 +316,10 @@ export class SpiralEngine {
     // at all — it collapsed into a blob. The spiral gets its depth from dot
     // size and haze instead, which costs nothing anywhere else.
     const spacing = this.clamp(Math.round(w / 46), 20, 32); // grid pitch in px — smaller divisor = denser grid
-    const dotR = spacing * 0.16;
+    // Two radii, because the landing dots sit in a pitch LANDING_STRIDE times
+    // wider than the grid's own and have to stay in proportion to it.
+    const dotR = spacing * this.GRID_DOT_FRAC_DENSE;
+    const landingR = spacing * this.LANDING_STRIDE * this.GRID_DOT_FRAC;
     const cols = Math.ceil(w / spacing) + 3;
     const rows = Math.ceil(h / spacing) + 3;
     const particles = [];
@@ -300,7 +335,40 @@ export class SpiralEngine {
           gy > h + spacing * 1.5
         )
           continue;
-        particles.push({ gx, gy });
+        // LANDING is a sparse SUBSET of the grid, not a sparser grid. The
+        // pool feeding every later stage is this same array, so actually
+        // thinning it would strip the words and the starburst of the
+        // particles they're made from. Instead the landing shows one dot in
+        // every LANDING_STRIDE^2 and the rest arrive with the explosion.
+        //
+        // An odd stride keeps consecutive chosen rows on opposite sides of
+        // the brick offset, so the subset stays staggered like the full grid
+        // rather than collapsing to a plain square lattice.
+        // Brick the SUBSET, not the grid. The grid's own stagger is half its
+        // pitch, which against a stride-wide gap is a barely-visible 10% nudge
+        // — so alternate landing rows pick columns shifted by half a stride
+        // instead, giving the pattern a proper offset at its own scale.
+        const k = this.LANDING_STRIDE;
+        const phase = (((r / k) | 0) % 2) * Math.floor(k / 2);
+        const landing = r % k === 0 && (((c - phase) % k) + k) % k === 0;
+
+        // Which polka dot this particle belongs to — the nearest landing cell.
+        // Hidden particles start life stacked inside their parent and fly out
+        // of it, so the explosion looks like each big dot SHATTERING. Fading
+        // them in where they already sit instead makes the full grid
+        // materialise underneath the pattern, which reads as two separate
+        // layers of dots rather than one turning into the other.
+        const rl = Math.round(r / k) * k;
+        const phaseL = (((rl / k) | 0) % 2) * Math.floor(k / 2);
+        const cl = Math.round((c - phaseL) / k) * k + phaseL;
+        const staggerL = rl % 2 === 0 ? 0 : spacing / 2;
+        particles.push({
+          gx,
+          gy,
+          landing,
+          ox: -spacing * 1.5 + cl * spacing + staggerL,
+          oy: -spacing * 1.5 + rl * spacing,
+        });
       }
     }
     const N = particles.length;
@@ -318,6 +386,29 @@ export class SpiralEngine {
       p.rox = 0;
       p.roy = 0; // smoothed cursor-repel offset (star stage)
       p.dotR = dotR * (0.82 + this.hash(i * 5.1) * 0.32); // grid-stage dot radius, slightly randomised
+      // The landing dots are deliberately uniform — a polka-dot field is a
+      // regular pattern, and size jitter reads as sloppiness at this spacing
+      // rather than as the texture it gives a dense field.
+      p.landingR = landingR;
+
+      // DISINTEGRATION. Every particle in a cell — the landing dot included —
+      // starts as a fragment scattered across the parent's face, so the disc
+      // IS its pieces rather than a disc that emits them. Come the explosion
+      // they simply drift apart and the disc comes to bits.
+      //
+      // sqrt() on the radius spreads fragments evenly by AREA; without it
+      // they crowd the centre and the rim of the disc goes ragged.
+      // Sized to over-cover: the pieces have to overlap into a solid disc at
+      // rest, or the pattern visibly turns to gravel the instant it starts.
+      p.fragR = (landingR * 1.7) / this.LANDING_STRIDE;
+      // Placed so the whole PIECE fits inside the disc, not just its centre.
+      // Scattering centres across the full radius lets each fragment hang its
+      // own radius past the edge, and the polka dots come out as lumpy
+      // clusters instead of circles.
+      const fa = this.hash(i * 53.1) * Math.PI * 2;
+      const fd = Math.sqrt(this.hash(i * 59.3)) * Math.max(0, landingR - p.fragR);
+      p.fragX = p.ox + Math.cos(fa) * fd;
+      p.fragY = p.oy + Math.sin(fa) * fd;
       p.dustR = 1.6 * (0.65 + this.hash(i * 9.3) * 0.95); // radius used for spiral/word stages ("dust" size)
       p.delayFrac = Math.hypot(p.gx - cx, p.gy - cy) / maxDist; // 0 near centre, 1 at the edge — staggers the explode stage
       const roll = this.hash(i * 13.1);
@@ -2190,7 +2281,10 @@ export class SpiralEngine {
             ctx.fillStyle =
               p.colorSlot === -1
                 ? this.INK
-                : this.towardInk(palette[p.colorSlot], starPresence);
+                : this.towardInk(
+                    this.slotColor(p.colorSlot, palette),
+                    starPresence,
+                  );
           }
           if (this.dotsGL) {
             this.dotsGL.push(x, y, r, ctx.fillStyle, 1);
@@ -2249,12 +2343,38 @@ export class SpiralEngine {
         m = 0;
         fx = p.gx;
         fy = p.gy + bob;
-        fr = p.dotR;
+        fr = p.landingR;
+        if (!p.landing) continue; // not part of the landing pattern
       } else if (stage.kind === "explode") {
         m = this.clamp(stage.mix * 1.9 - p.delayFrac * 0.9, 0, 1); // outer particles lag behind
-        fx = p.gx;
-        fy = p.gy;
-        fr = p.dotR;
+        // Everything starts as a fragment of its parent polka dot, spread
+        // across the disc's face rather than stacked at its centre — the disc
+        // disintegrates instead of spraying out of a point.
+        fx = p.fragX;
+        fy = p.fragY;
+        // The split. A child starts at ZERO SIZE inside its parent and grows
+        // as it travels out; the parent shrinks from polka-dot size down to
+        // an ordinary grid dot as it goes. So the small dots are made of the
+        // big one rather than arriving alongside it.
+        //
+        // Size, not opacity, is what sells this. Fading a child in is still
+        // the child appearing — it just appears softly. Growing it out of a
+        // point means there is no frame where it exists without having come
+        // from somewhere. (`r` lerps fr -> spiral size by the same `m`, so
+        // zero here grows the whole way on its own.)
+        // Every particle is a fragment now, so they all start at fragment
+        // size — no special case for the landing dot. `r` lerps this toward
+        // the spiral size by the same `m` that carries them apart, so the
+        // pieces shrink as they scatter without a second curve to keep in
+        // step with the movement.
+        // The landing dot holds its full size briefly and shrinks into a
+        // fragment. It's the clean circle the eye is already looking at, so
+        // keeping it a moment longer covers the fragments underneath while
+        // they're still packed — by the time it's gone they've spread enough
+        // that their silhouette no longer has to read as a disc.
+        fr = p.landing
+          ? this.lerp(p.landingR, p.fragR, this.clamp(m * 2.4, 0, 1))
+          : p.fragR;
       } else if (stage.kind === "toWord") {
         const lp = this.wordPointsFor(stage.word, i, elapsed);
         m = 1 - stage.mix;
@@ -2290,13 +2410,18 @@ export class SpiralEngine {
       const persp = this.orbitPersp(z);
       const x = this.lerp(fx, cx + wx * persp, m);
       const y = this.lerp(fy, cy + wy * persp, m);
-      const r = this.lerp(fr, p.spiralDotR * persp, m);
+      // Size settles FASTER than position. A fragment has to be big enough to
+      // help cover its polka dot at rest — around twice the spiral's dot size
+      // — so carrying that size across the whole journey sends visible chunks
+      // into a field of much finer dots. Shrinking early means a piece breaks
+      // off, becomes a spiral dot, and then travels as one.
+      const r = this.lerp(fr, p.spiralDotR * persp, this.clamp(m * 2.4, 0, 1));
       // Haze is the one cue perspective doesn't give you, so it stays
       // authored — and keyed to radius rather than z, so it grades across the
       // whole field instead of collapsing into the core.
       const a = this.lerp(1, p.spiralFade, m);
 
-      const fill = p.colorSlot === -1 ? this.INK : palette[p.colorSlot];
+      const fill = this.slotColor(p.colorSlot, palette);
       // One emitter for the head and every tail sample, so the trail can't
       // drift out of step with the dot it belongs to. Depth is shared too —
       // the tail sits at the same z as its head, which keeps it inside the

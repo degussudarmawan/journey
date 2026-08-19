@@ -66,8 +66,14 @@ class ColorCache {
   get(css) {
     let c = this.map.get(css);
     if (c) return c;
-    this.ctx.clearRect(0, 0, 1, 1);
+    // Assigning an unparseable value to fillStyle is a SILENT no-op — the
+    // context keeps whatever it had, so a bad colour samples as either black
+    // (fresh context) or the last good colour, and then caches under that key
+    // forever. Setting a known value first makes the failure visible as that
+    // value instead of as a mystery.
+    this.ctx.fillStyle = "#ff00ff";
     this.ctx.fillStyle = css;
+    this.ctx.clearRect(0, 0, 1, 1);
     this.ctx.fillRect(0, 0, 1, 1);
     const [r, g, b] = this.ctx.getImageData(0, 0, 1, 1).data;
     // sRGB -> linear, because the renderer outputs sRGB and would otherwise

@@ -76,13 +76,38 @@ export class SpiralEngine {
   // INK is the "settled" colour: dots fade toward it as the star forms, and
   // ~40% of particles (colorSlot === -1) are always drawn in it.
   // INK = "#dfe0e2";
-  INK = "#f1f10e"; // bright yellow
-  // INK = "#2a2a2f";
+  // INK = "#f1f10e"; // bright yellow
+  INK = "#2a2a2f";
 
   // ---- Eight-point starburst tuning ------------------------------------------
   STAR_VALLEY = 0.2; // valley radius, as a fraction of R
   STAR_BOW = 0.3; // 0 = perfectly straight edges, 1 = collapsed on axis
   STAR_LUT_N = 2048; // angular resolution of the radius lookup table
+
+  // ---- Star depth (the star as a solid, not a sheet) --------------------------
+  // The star used to be a flat halftone: every dot at z = 0, volume faked
+  // only later, once a spike had detached into the orbit. It now shows the
+  // thickness it always had in the data — `sub.rayUp`, ONE cross-section
+  // measured once by _spindle() and shared by the star and the needle it
+  // becomes. There is deliberately no separate star thickness: give the star
+  // its own and the rays stop being the shape they were, which is exactly
+  // what happened the first time this was tried.
+  //
+  // So the thickness knob is ORBIT_THICKNESS, and it governs both. Raising it
+  // makes the star rounder AND the needles fatter, because they are the same
+  // solid seen at two moments.
+  //
+  // STAR_DEPTH is the master switch: 0 flattens the star, stops the sway, and
+  // puts the old inflate-on-detach back — one number to undo the whole thing.
+  STAR_DEPTH = 1;
+  // Volume you can't move around is hard to read: perspective alone barely
+  // registers over this depth range. A slow body sway supplies the parallax.
+  // Sway rather than spin on purpose — the silhouette is an authored shape
+  // (starTips/STAR_BOW), and a full turn would foreshorten it away.
+  STAR_SWAY_YAW = 0.19; // radians, about the vertical
+  STAR_SWAY_PITCH = 0.1; // radians, about the horizontal
+  STAR_DEPTH_FADE = 2.2; // how much far dots fade; 0 = no depth shading
+  STAR_MIN_ALPHA = 0.55; // floor on that fade, so far dots never vanish
 
   // ---- Galaxy-style spiral motion tuning --------------------------------------
   // See buildGrid() (where these are rolled per-particle) and loop()'s
@@ -839,6 +864,7 @@ export class SpiralEngine {
     }
 
     this.buildOrbitRays();
+    this.buildStarDepth(); // fills in any spike the orbit didn't measure
   }
 
   // ---- Orbiting ray pieces (the final act) ------------------------------------
@@ -862,9 +888,9 @@ export class SpiralEngine {
   //      the ring's normal (see orbitFrame) with its width along the track and
   //      its thickness radial, so it foreshortens and leans as it swings
   //      around, and rayUp gives it a round cross-section instead of zero
-  //      thickness. That thickness is scaled by detach progress, so a piece
-  //      "inflates" from the star's flat halftone into a solid needle as it
-  //      leaves.
+  //      thickness. A piece leaves at the thickness it already had in the
+  //      star — it used to "inflate" from flat, which made sense only while
+  //      the star itself was flat. See orbitDotPos.
   //
   // Indices into starTips(): 0:-137° 1:-90° 2:-47° 3:0° 4:43° 5:90° 6:136° 7:180°
   // Listed in detach order: starts with the long bottom ray, then sweeps
@@ -951,6 +977,107 @@ export class SpiralEngine {
   VIEW_EASE = 0.14; // per-frame approach to the drag target
   VIEW_DRAG_SLOP = 5; // px of movement before a press stops being a click
 
+  /**
+   * Gives one spike's dots a ROUND CROSS-SECTION, and writes the resulting
+   * out-of-plane offset onto each of them.
+   *
+   * The star is authored as a flat halftone — a silhouette filled with dots,
+   * with no thickness anywhere in the data. So thickness has to be inferred:
+   * measure how wide the spike is at each point along its axis (bucketed max
+   * |across|), treat that width as the radius of a circular cross-section,
+   * and place each dot somewhere on the chord it has left in the third
+   * dimension. A dot on the spike's edge has no room and stays in plane; one
+   * on the axis can go the full radius either way. The result is a spindle
+   * with volume rather than a sheet.
+   *
+   * Written as a helper because two callers need exactly this and for the
+   * same reason: buildOrbitRays() to inflate a needle as it detaches, and
+   * buildStarDepth() to give the assembled star its depth. It used to exist
+   * only in the first, which is why the star was flat right up until the
+   * moment a piece left it.
+   *
+   * @param {object[]} subs halftone sub-dots, each with {r0, theta}
+   * @param {number} axisAngle the spike's axis, in star-centre coordinates
+   * @param {number} length the spike's reach, for bucketing along the axis
+   * @param {number} thickness multiplier on the recovered cross-section
+   * @param {string} field property to write the offset to
+   * @param {number} seed decorrelates the jitter between spikes
+   */
+  _spindle(subs, axisAngle, length, thickness, field, seed) {
+    const NB = 48;
+    const half = new Float64Array(NB);
+    const ca = Math.cos(axisAngle),
+      sa = Math.sin(axisAngle);
+    const len = Math.max(1, length);
+    const bucketOf = (along) =>
+      this.clamp(Math.floor((along / len) * NB), 0, NB - 1);
+    const along = new Float64Array(subs.length);
+    const across = new Float64Array(subs.length);
+    for (let i = 0; i < subs.length; i++) {
+      const s = subs[i];
+      const x = s.r0 * Math.cos(s.theta);
+      const y = s.r0 * Math.sin(s.theta);
+      along[i] = x * ca + y * sa;
+      across[i] = -x * sa + y * ca;
+      const b = bucketOf(along[i]);
+      const a = Math.abs(across[i]);
+      if (a > half[b]) half[b] = a;
+    }
+    for (let i = 0; i < subs.length; i++) {
+      const hw = half[bucketOf(along[i])];
+      const room = Math.sqrt(Math.max(0, hw * hw - across[i] * across[i]));
+      subs[i][field] =
+        (this.hash(i * 13.77 + seed * 3.1) - 0.5) * 2 * room * thickness;
+    }
+  }
+
+  /**
+   * Gives EVERY spike depth, so the star has volume while it is still
+   * assembled rather than only once a piece detaches.
+   *
+   * Deliberately independent of ORBIT_SPIKES. The orbit's own version only
+   * covers the spikes that leave, and that list is documented as something
+   * you can shorten — so leaning on it would mean the star silently went
+   * part-flat the moment somebody kept a spike at home.
+   */
+  /**
+   * Fills in depth for any spike that DOESN'T orbit.
+   *
+   * The star's thickness and the needle's are now the same number —
+   * `sub.rayUp`, one solid measured once. buildOrbitRays() already computes
+   * it for every spike in ORBIT_SPIKES, which today is all eight, so this
+   * usually has nothing to do.
+   *
+   * It exists because that list is documented as something you can shorten.
+   * Without this, keeping a spike at home would leave its dots with no depth
+   * at all and that one arm of the star would go flat while the rest didn't.
+   *
+   * Runs AFTER buildOrbitRays for exactly that reason: it's filling gaps the
+   * orbit left, not competing with it.
+   */
+  buildStarDepth() {
+    const groups = new Map();
+    for (const p of this.particles) {
+      if (!p.starSub) continue;
+      for (const sub of p.starSub) {
+        if (sub.rayUp !== undefined) continue; // the orbit already measured it
+        const g = groups.get(sub.ray);
+        if (g) g.push(sub);
+        else groups.set(sub.ray, [sub]);
+      }
+    }
+    for (const [k, subs] of groups) {
+      this._spindle(
+        subs,
+        this.starTipsList[k].a,
+        this.starTipsList[k].len,
+        this.ORBIT_THICKNESS,
+        "rayUp",
+        k,
+      );
+    }
+  }
+
   // Partitions every halftone dot into its spike and records it in that
   // spike's local 3D frame. Dots belonging to spikes not listed in
   // ORBIT_SPIKES stay in star formation forever (orbitResidue).
@@ -998,36 +1125,16 @@ export class SpiralEngine {
       }
     }
 
-    // Give each needle a round cross-section. The star is a flat halftone, so
-    // there's no real depth to read off it: instead, measure how wide the
-    // spike is at each point along its axis (bucketed max |across|), then
-    // treat that as the radius of a circular cross-section and place the dot
-    // somewhere on the remaining out-of-plane chord. Result is a spindle with
-    // volume rather than a flat sheet.
-    const NB = 48;
     groups.forEach((g, gi) => {
       const slot = this.orbitSlots[gi];
-      const half = new Float64Array(NB);
-      const bucketOf = (along) =>
-        this.clamp(Math.floor((along / slot.needleLen) * NB), 0, NB - 1);
-      for (const { sub } of g) {
-        const b = bucketOf(sub.rayAlong);
-        const across = Math.abs(sub.rayAcross);
-        if (across > half[b]) half[b] = across;
-      }
-      let i = 0;
-      for (const { sub } of g) {
-        const hw = half[bucketOf(sub.rayAlong)];
-        const room = Math.sqrt(
-          Math.max(0, hw * hw - sub.rayAcross * sub.rayAcross),
-        );
-        sub.rayUp =
-          (this.hash(i * 13.77 + gi * 3.1) - 0.5) *
-          2 *
-          room *
-          this.ORBIT_THICKNESS;
-        i++;
-      }
+      this._spindle(
+        g.map((e) => e.sub),
+        slot.spikeAngle,
+        slot.needleLen,
+        this.ORBIT_THICKNESS,
+        "rayUp",
+        gi,
+      );
     });
 
     this.orbitGroups = groups;
@@ -1056,10 +1163,25 @@ export class SpiralEngine {
   /** Rotates a world point into view space, then projects it to the screen. */
   project(x, y, z) {
     const v = this.view;
-    const cy = Math.cos(v.yaw),
-      sy = Math.sin(v.yaw);
-    const cp = Math.cos(v.pitch),
-      sp = Math.sin(v.pitch);
+    // HANDING OVER THE STAR'S SWAY. The star turns gently about its own
+    // centre (projectStar), and the orbit doesn't — so at the instant the
+    // orbit stage takes over, the whole assembly would snap back to square.
+    // Nothing has moved; only the projection changed hands. Around 15px at
+    // the sway's peak, which is very visible on a shape that was holding
+    // still a frame earlier.
+    //
+    // So the orbit's camera borrows the star's angles at the changeover and
+    // gives them up as the ring forms. Rotating the camera about the orbit
+    // centre isn't quite rotating the star about its own — the two centres
+    // differ by 0.14R vertically — but at these angles that's under a pixel,
+    // and it makes the handover invisible.
+    const carry = this._swayCarry || 0;
+    const yaw = v.yaw + (carry && this._sf ? this._sf.yaw * carry : 0);
+    const pitch = v.pitch + (carry && this._sf ? this._sf.pitch * carry : 0);
+    const cy = Math.cos(yaw),
+      sy = Math.sin(yaw);
+    const cp = Math.cos(pitch),
+      sp = Math.sin(pitch);
     const ax = x * cy + z * sy; // yaw about the vertical
     const az = z * cy - x * sy;
     const ay = y * cp - az * sp; // then pitch about the horizontal
@@ -1127,9 +1249,16 @@ export class SpiralEngine {
     return az * Math.cos(v.pitch) + y * Math.sin(v.pitch);
   }
 
-  /** A star-formation screen point, lifted into the orbit's space at z = 0. */
+  /**
+   * A star-formation screen point, lifted into the orbit's space.
+   *
+   * Carries the dot's own z rather than pinning it to the z = 0 plane, so
+   * whatever is left of the star has the same thickness in the orbit that it
+   * had while assembled. Flat here meant the core turned into a sheet the
+   * moment the camera swung off axis.
+   */
   projectStarPoint(sp) {
-    return this.project(sp.x - this.orbitCx, sp.y - this.orbitCy, 0);
+    return this.project(sp.x - this.orbitCx, sp.y - this.orbitCy, sp.z ?? 0);
   }
 
   /**
@@ -1279,9 +1408,22 @@ export class SpiralEngine {
       pose.cy = cyy / cl;
       pose.cz = czz / cl;
 
-      pose.ux = hx;
-      pose.uy = hy;
-      pose.uz = hz;
+      // ...and the out-of-plane axis, blended like the other two. It used to
+      // be set straight to the detached value with no blend, which was
+      // harmless only because the thickness along it was `rayUp * e` — zero
+      // at e = 0, so the axis it pointed along didn't matter. Now a piece
+      // carries the star's thickness from the very start, so it does: at
+      // e = 0 this has to be the star's own plane normal (0, 0, 1), which is
+      // exactly `a x c` for the attached frame. Left as `h`, every dot's
+      // depth would have been applied along the ring's thickness axis while
+      // the piece was still sitting in the star, shearing it.
+      let uxx = hx * e,
+        uyy = hy * e,
+        uzz = this.lerp(1, hz, e);
+      const ul = Math.hypot(uxx, uyy, uzz) || 1;
+      pose.ux = uxx / ul;
+      pose.uy = uyy / ul;
+      pose.uz = uzz / ul;
       pose.slot = slot;
       // Coarse piece-level depth ordering, in VIEW space rather than world
       // space. Sorting on world z would be right only from the default
@@ -1296,13 +1438,27 @@ export class SpiralEngine {
   }
 
   // Screen placement of one halftone dot inside its piece: position it in the
-  // piece's 3D frame, then project. Out-of-plane thickness is scaled by
-  // detach progress so an attached piece is exactly as flat as the star it's
-  // still part of.
+  // piece's 3D frame, then project.
+  //
+  // Out-of-plane thickness used to be `rayUp * e` — zero while attached,
+  // full once detached — so a piece INFLATED as it left. That was right when
+  // the star was a flat halftone and had no thickness to be continuous with.
+  // Now it does, and starting from zero meant the star visibly went flat
+  // again the moment the spikes began to separate: a 2D-to-3D transformation
+  // where there should only have been a separation.
+  //
+  // It's now `rayUp` flat out, unscaled: the piece leaves at exactly the
+  // thickness it had while attached and never changes shape at all — the
+  // rigid body this file's own header always claimed it was. Nothing about
+  // the needle's form differs from before this was touched. What changed is
+  // that the star it comes out of already has that form.
+  //
+  // With STAR_DEPTH = 0 the near end goes to zero and this collapses back to
+  // `rayUp * e` exactly: flat star, inflating detach, as it was.
   orbitDotPos(sub, f) {
     const la = sub.rayAlong - f.slot.anchorAlong;
     const lc = sub.rayAcross;
-    const lu = sub.rayUp * f.e;
+    const lu = this.lerp(sub.rayUp * this.STAR_DEPTH, sub.rayUp, f.e);
     return this.project(
       f.px + la * f.ax + lc * f.cx + lu * f.ux,
       f.py + la * f.ay + lc * f.cy + lu * f.uy,
@@ -1662,7 +1818,67 @@ export class SpiralEngine {
           Math.sin(elapsed * 0.41 + rp * 1.9 + 2.1) * 0.55) *
         sway;
     }
-    this._sf = { bend, drift: Math.sin(elapsed * 0.17) * 0.05, t: elapsed };
+    // Whole-body sway, on top of the per-ray bend. Two slow sines at
+    // unrelated rates so the star never returns to a pose you've just seen
+    // and the motion doesn't read as a loop.
+    const d = this.STAR_DEPTH;
+    this._sf = {
+      bend,
+      drift: Math.sin(elapsed * 0.17) * 0.05,
+      t: elapsed,
+      yaw: Math.sin(elapsed * 0.23) * this.STAR_SWAY_YAW * d,
+      pitch: Math.sin(elapsed * 0.31 + 1.1) * this.STAR_SWAY_PITCH * d,
+    };
+  }
+
+  /**
+   * Projects a star point — which now has a z — to the screen.
+   *
+   * Turns the star about its OWN centre and divides by the same
+   * `orbitPersp()` the rest of the piece uses, so a dot's depth shrinks its
+   * offset and its size by one shared factor. That coupling is what makes
+   * this read as a solid rather than as a flat star with some dots drawn
+   * smaller; it's the same argument as the spiral funnel's.
+   *
+   * Not the orbit's project(): that one is a camera the viewer can drag, and
+   * the star stage has no free look. Sharing it would have welded the star to
+   * whatever the orbit's camera was left at.
+   */
+  projectStar(x, y, z) {
+    const f = this._sf;
+    const dx = x - this.starCx,
+      dy = y - this.starCy;
+    const cy = Math.cos(f.yaw),
+      sy = Math.sin(f.yaw);
+    const ax = dx * cy + z * sy; // yaw about the vertical
+    const az = z * cy - dx * sy;
+    const cp = Math.cos(f.pitch),
+      sp = Math.sin(f.pitch);
+    const ay = dy * cp - az * sp; // then pitch about the horizontal
+    const bz = az * cp + dy * sp;
+    const persp = this.orbitPersp(bz);
+    return {
+      x: this.starCx + ax * persp,
+      y: this.starCy + ay * persp,
+      scale: persp,
+      z: bz,
+    };
+  }
+
+  /**
+   * Haze for depth: far dots sit back a little. Mirrors the orbit's rule,
+   * with one addition — a ceiling. The orbit's pieces are always at or behind
+   * the focal plane so its scale never exceeds 1, but the star straddles its
+   * own centre, and a dot on the NEAR face comes out at scale > 1. Left
+   * unclamped that asks for alpha 1.09, which the 2D context rejects and the
+   * GPU turns into a blown-out dot.
+   */
+  starDepthAlpha(scale) {
+    return this.clamp(
+      1 - (1 - scale) * this.STAR_DEPTH_FADE,
+      this.STAR_MIN_ALPHA,
+      1,
+    );
   }
 
   // Live (x,y) for one halftone sample point, combining: ray bend (sways the
@@ -1688,6 +1904,11 @@ export class SpiralEngine {
         this.starCy +
         Math.sin(ang) * rad +
         Math.sin(elapsed * 1.1 + sub.ph) * sh,
+      // The dot's out-of-plane offset — the SAME cross-section the needle
+      // will have once this spike detaches, not a second one authored for
+      // the star. Still in the star's own flat frame; callers project it,
+      // because the star stage and the orbit use different cameras.
+      z: (sub.rayUp ?? 0) * this.STAR_DEPTH,
     };
   }
 
@@ -1987,6 +2208,8 @@ export class SpiralEngine {
         }
       }
       this.starFrame(elapsed); // the un-detached remainder is still a star
+      // Full at the changeover, gone once the ring has formed — see project().
+      this._swayCarry = stage.kind === "toOrbit" ? 1 - stage.mix : 0;
       this.orbitFrame(elapsed, stage.kind === "toOrbit" ? stage.mix : 1);
       ctx.fillStyle = this.INK;
 
@@ -2253,19 +2476,30 @@ export class SpiralEngine {
           : null;
         for (let k = 0; k < p.starSub.length; k++) {
           const sub = p.starSub[k];
+          // Project through the star's own turn: a dot's z shrinks both its
+          // offset from centre and its radius by the one shared factor.
           const sp = this.starPointFor(sub, elapsed);
-          let x, y, r;
+          const pr = this.projectStar(sp.x, sp.y, sp.z);
+          let x, y, r, z, depthA;
           if (toStar) {
             // Outer ray pieces arrive last, so the star grows from its core.
             const m = this.clamp(stage.mix * 1.55 - sub.u * 0.45, 0, 1);
             const e = m * m * (3 - 2 * m); // smoothstep ease
-            x = this.lerp(lp.x, sp.x, e);
-            y = this.lerp(lp.y, sp.y, e);
-            r = this.lerp(p.dustR, sub.dotR, e);
+            x = this.lerp(lp.x, pr.x, e);
+            y = this.lerp(lp.y, pr.y, e);
+            r = this.lerp(p.dustR, sub.dotR * pr.scale, e);
+            // Depth arrives WITH the star. A word is flat on the screen
+            // plane, so a dot that carried its final z through the whole
+            // approach would be sorting against a solid that isn't there
+            // yet — and would pop in size as the perspective took hold.
+            z = pr.z * e;
+            depthA = this.lerp(1, this.starDepthAlpha(pr.scale), e);
           } else {
-            x = sp.x;
-            y = sp.y;
-            r = sub.dotR;
+            x = pr.x;
+            y = pr.y;
+            r = sub.dotR * pr.scale;
+            z = pr.z;
+            depthA = this.starDepthAlpha(pr.scale);
           }
           const rp = this.repelFromPointer(
             sub,
@@ -2287,13 +2521,21 @@ export class SpiralEngine {
                   );
           }
           if (this.dotsGL) {
-            this.dotsGL.push(x, y, r, ctx.fillStyle, 1);
+            // Hand over the real z, not just a smaller dot. That's what puts
+            // these in the depth buffer, so a dot on the star's near face
+            // genuinely occludes one on its far face instead of the two
+            // blending into the same grey.
+            this.dotsGL.push(x, y, r, ctx.fillStyle, depthA, z);
           } else if (r < 1.6) {
+            ctx.globalAlpha = depthA;
             ctx.fillRect(x - r, y - r, r * 2, r * 2); // sub-pixel dots: a filled square reads sharper than a tiny circle
+            ctx.globalAlpha = 1;
           } else {
+            ctx.globalAlpha = depthA;
             ctx.beginPath();
             ctx.arc(x, y, r, 0, Math.PI * 2);
             ctx.fill();
+            ctx.globalAlpha = 1;
           }
         }
         continue;

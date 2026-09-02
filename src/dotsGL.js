@@ -27,6 +27,7 @@ import * as THREE from "three";
 import { buildKeyMesh } from "./key3d";
 import { buildLock, lockMetrics } from "./lock3d";
 import { DOOR_FILL, LEAF_DEPTH_FRAC } from "./door3d";
+import { FEATHER_VERT, FEATHER_FRAG } from "./featherGL";
 
 const MAX_DOTS = 24000; // ~1.6k particles x 4 halftone sub-dots, with headroom
 
@@ -144,12 +145,19 @@ const FRAG = /* glsl */ `
 `;
 
 export class DotsGL {
-  /** @param {HTMLElement} container element to hang the GL canvas inside. */
-  constructor(container) {
+  /**
+   * @param {HTMLElement} container element to hang the GL canvas inside.
+   * @param {object|null} feather when set (?dots=feather), swaps the point
+   *   sprite's shaders for the crow-feather ones. An experiment — see
+   *   featherGL.js. Null keeps the dots exactly as they are; nothing else in
+   *   this class knows the difference.
+   */
+  constructor(container, feather = null) {
     this.container = container;
     this.ok = false;
     this.count = 0;
     this.colors = new ColorCache();
+    this.feather = feather;
   }
 
   mount() {
@@ -201,23 +209,24 @@ export class DotsGL {
     g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e9);
     this.geometry = g;
 
-    this.material = new THREE.ShaderMaterial({
-      vertexShader: VERT,
-      fragmentShader: FRAG,
-      uniforms: { pixelRatio: { value: this.pixelRatio } },
-      transparent: true,
-      // Real depth, which is the entire point of moving the dots here. Left
-      // off (as it was through the prototype) nothing can occlude the key: it
-      // draws over every dot regardless of where it is in the ring, so a key
-      // on the ring's FAR side still paints over the near needles and the
-      // orbit stops reading as an orbit at all.
-      //
-      // depthWrite matters as much as depthTest — without it the dots test
-      // against the key but never record themselves, so the key is never
-      // hidden BY them, only they by it.
-      depthTest: true,
-      depthWrite: true,
-    });
+    this.material = this._makeMaterial();
+
+    // A feather shader that fails to compile would otherwise be a black
+    // screen and a wall of GL log — so catch it and fall back to the dots on
+    // the next frame. Swapping here would mean changing the material three is
+    // in the middle of setting up, hence the flag.
+    if (this.feather) {
+      this.renderer.debug.onShaderError = (gl, program, vs, fs) => {
+        const log =
+          gl.getShaderInfoLog(fs) || gl.getShaderInfoLog(vs) || "(no log)";
+        console.error(
+          "[featherGL] feather shader failed to compile — falling back to " +
+            "the dots. Remove ?dots=feather to silence this.\n" +
+            log,
+        );
+        this._featherFailed = true;
+      };
+    }
 
     this.points = new THREE.Points(g, this.material);
     this.points.frustumCulled = false;
@@ -244,6 +253,45 @@ export class DotsGL {
 
     this.ok = true;
     return true;
+  }
+
+  /**
+   * The point-sprite material for whichever look is active.
+   *
+   * Extracted so the feather experiment can be abandoned mid-flight (see the
+   * shader-error hook in mount()) without the dot configuration existing in
+   * two places and drifting apart.
+   */
+  _makeMaterial() {
+    const f = this.feather;
+    return new THREE.ShaderMaterial({
+      vertexShader: f ? FEATHER_VERT : VERT,
+      fragmentShader: f ? FEATHER_FRAG : FRAG,
+      uniforms: f
+        ? {
+            pixelRatio: { value: this.pixelRatio },
+            uTime: { value: 0 },
+            uSpread: { value: f.spread },
+            uWidth: { value: f.width },
+            uSheen: { value: f.sheen },
+            uGain: { value: f.gain },
+            uFlutter: { value: f.flutter },
+            uTintMix: { value: f.tint },
+          }
+        : { pixelRatio: { value: this.pixelRatio } },
+      transparent: true,
+      // Real depth, which is the entire point of moving the dots here. Left
+      // off (as it was through the prototype) nothing can occlude the key: it
+      // draws over every dot regardless of where it is in the ring, so a key
+      // on the ring's FAR side still paints over the near needles and the
+      // orbit stops reading as an orbit at all.
+      //
+      // depthWrite matters as much as depthTest — without it the dots test
+      // against the key but never record themselves, so the key is never
+      // hidden BY them, only they by it.
+      depthTest: true,
+      depthWrite: true,
+    });
   }
 
   /**
@@ -456,6 +504,22 @@ export class DotsGL {
    */
   begin(w, h, focal, pan) {
     if (!this.ok) return;
+    if (this._featherFailed) {
+      this._featherFailed = false;
+      this.feather = null;
+      this.renderer.debug.onShaderError = null;
+      const dead = this.material;
+      this.material = this._makeMaterial();
+      this.points.material = this.material;
+      dead.dispose();
+    }
+    // The feather shader rocks its sprites over time. Clocked from here
+    // rather than from the caller's `elapsed` so the experiment costs the
+    // engine no signature change at all — it doesn't need to be in step with
+    // anything, it only needs to advance.
+    if (this.feather) {
+      this.material.uniforms.uTime.value = performance.now() / 1000;
+    }
     this.focal = focal;
     this.cx = w / 2;
     this.cy = h / 2;

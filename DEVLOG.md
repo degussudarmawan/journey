@@ -9,6 +9,67 @@ Legend: **✅ verified** = I actually looked at it rendering.
 
 ---
 
+## 2026-08-25 — Crow feathers instead of dots, behind `?dots=feather` ⚠️
+
+`src/featherGL.js` (new), `src/dotsGL.js`, `src/Spiral.jsx`
+
+User: "I wanna see how it looks like if we change the dots in the spiral into
+crow black feather... but dont delete the current one cuz i just wanna see how
+it look like". So: a look-see, strictly additive, nothing removed.
+
+Built as a second pair of shaders rather than a branch inside the existing
+ones. `VERT`/`FRAG` in `dotsGL.js` are untouched byte-for-byte; `_makeMaterial()`
+picks between them and the feather pair. The whole experiment is one new file
+plus the material swap — deleting it is deleting `featherGL.js` and five lines.
+
+The feather is a **procedural mask inside the point sprite**, not a texture:
+the dots span three orders of magnitude across the funnel, and a bitmap would
+be mush at both ends. Shape is a bowed shaft, asymmetric vanes (narrow leading,
+broad trailing), barb stripes running out-and-back from the rachis, a few
+unzipped splits at the edge, and a blue→green→violet oil-slick that strengthens
+toward the tip — crow black being a very dark base under a sheen, not flat
+black.
+
+Two things this had to solve that a dot doesn't have:
+
+- **Orientation, with no call-site changes.** Every stage is composed around a
+  centre, so `atan(position.y, position.x) + π/2` is the direction the field is
+  actually travelling — feathers stream along the arms for free. Variation
+  comes from a smooth spatial phase, deliberately *not* a hash: a hash of a
+  moving position pops each time a dot crosses a cell.
+- **A sprite big enough to hold it.** A feather is ~4:1, so a sprite sized to
+  the dot fits a feather a quarter the dot's length. The quad grows by
+  `spread` (3.4x) and alpha is compensated back down — `sqrt` of the area
+  ratio, not the full ratio the dot shader uses, since the mask only inks a
+  fraction of the quad.
+
+### Side effects
+
+- **Fill rate.** Sprites 3.4x wider are ~12x the fill, and the near orbit
+  needles are already large. Expect this to be heavier than the dots. Untested
+  on this machine — no headless GL here.
+- **Under ~5px of quad it draws the ordinary dot instead**, at the dot's real
+  size inside the grown quad. Without that the mask aliases to nothing and the
+  far half of the funnel disappears — which reads as a broken renderer, not as
+  feathers. There is a visible character change at that threshold; it's a
+  prototype, so it's left hard rather than blended.
+- **Overlap ordering** is the same transparent-with-depthWrite bargain the
+  dots already make, but feathers are much bigger, so any artefact is more
+  visible.
+- `renderer.debug.onShaderError` is now hooked **while in feather mode only**,
+  and clears itself on fallback. If the feather shader fails to compile it
+  logs once and swaps back to the dots next frame, rather than leaving a black
+  screen. Nothing else in the app sets that hook today; if something ever does,
+  this will fight it.
+- Knobs are live on the query string, so tuning needs no rebuild:
+  `?dots=feather&spread=3.4&width=0.13&sheen=0.55&gain=1.35&flutter=0.16&tint=0.1`
+
+⚠️ **Unverified — nobody has seen this render.** No headless browser on this
+machine, so the GLSL has been read carefully but never compiled. The fallback
+hook above exists precisely because I couldn't check.
+
+---
+
 ## 2026-08-14 — Randomly black dots: a palette shorter than its slots ✅
 
 `src/spiralEngine.js`, `src/dotsGL.js`

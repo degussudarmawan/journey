@@ -3,6 +3,7 @@ import { SpiralEngine, DEFAULT_PALETTE } from "./spiralEngine";
 import { SketchLayer } from "./sketchLayer";
 import { Door3D } from "./door3d";
 import { DotsGL } from "./dotsGL";
+import { featherOptionsFromSearch } from "./featherGL";
 import KeyPage from "./KeyPage";
 
 /**
@@ -100,10 +101,15 @@ export default function Spiral({
     //
     // Canvas2D remains as an automatic fallback: if mount() fails there's no
     // WebGL context to be had, engine.dotsGL stays null, and the 2D path takes
-    // over on its own. `?dots=2d` forces it for side-by-side comparison.
+    // over on its own. `?dots=2d` forces it for side-by-side comparison, and
+    // `?dots=feather` swaps the point sprite for a crow feather — an
+    // experiment that leaves the dots themselves untouched. See featherGL.js.
     let dotsGL = null;
     if (new URLSearchParams(window.location.search).get("dots") !== "2d") {
-      dotsGL = new DotsGL(dotsLayerRef.current);
+      dotsGL = new DotsGL(
+        dotsLayerRef.current,
+        featherOptionsFromSearch(window.location.search),
+      );
       if (dotsGL.mount()) engine.dotsGL = dotsGL;
     }
 
